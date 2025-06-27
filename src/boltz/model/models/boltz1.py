@@ -211,7 +211,7 @@ class Boltz1(LightningModule):
             and confidence_model_args["use_s_diffusion"]
         )
         self.structure_module = AtomDiffusion(
-            score_model_args={
+            score_model_args={ # Arguments passed to score model.
                 "token_z": token_z,
                 "token_s": token_s,
                 "atom_z": atom_z,
@@ -271,7 +271,7 @@ class Boltz1(LightningModule):
 
     def forward(
         self,
-        feats: dict[str, Tensor],
+        feats: dict[str, Tensor], # Input tensor dict (passed in by predict_step)
         recycling_steps: int = 0,
         num_sampling_steps: Optional[int] = None,
         multiplicity_diffusion_train: int = 1,
@@ -355,17 +355,20 @@ class Boltz1(LightningModule):
                 )
             )
 
+        # Diffusion step. 
+        # Does Boltz not use the atom-level sequence representation for the 
+        # diffusion step?
         if (not self.training) or self.confidence_prediction:
             dict_out.update(
                 self.structure_module.sample(
-                    s_trunk=s,
-                    z_trunk=z,
-                    s_inputs=s_inputs,
+                    s_trunk=s, # Post-trunk token-level sequence.
+                    z_trunk=z, # Post-trunk token-level pairs.
+                    s_inputs=s_inputs, # Pre-trunk token-level sequence.
                     feats=feats,
                     relative_position_encoding=relative_position_encoding,
                     num_sampling_steps=num_sampling_steps,
                     atom_mask=feats["atom_pad_mask"],
-                    multiplicity=diffusion_samples,
+                    multiplicity=diffusion_samples, # Num. samples to generate (?)
                     max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
                     steering_args=self.steering_args,
@@ -1146,10 +1149,11 @@ class Boltz1(LightningModule):
         )
         self.best_rmsd.reset()
 
+    # What we're going to be working with.
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:
         try:
             out = self(
-                batch,
+                batch, # Dict of input tensors outputted by BoltzFeaturizer.
                 recycling_steps=self.predict_args["recycling_steps"],
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],

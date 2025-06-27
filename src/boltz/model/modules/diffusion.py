@@ -37,7 +37,7 @@ from boltz.model.modules.utils import (
 )
 from boltz.model.potentials.potentials import get_potentials
 
-
+# Boltz diffusion's score network.
 class DiffusionModule(Module):
     """Diffusion module"""
 
@@ -280,7 +280,7 @@ class OutTokenFeatUpdate(Module):
 
         return acc_a
 
-
+# Boltz structure prediction diffusion module.
 class AtomDiffusion(Module):
     """Atom diffusion module"""
 
@@ -415,6 +415,7 @@ class AtomDiffusion(Module):
 
         padded_sigma = rearrange(sigma, "b -> b 1 1")
 
+        # Should be looking closely at this.
         net_out = self.score_model(
             r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
             times=self.c_noise(sigma),
@@ -446,6 +447,7 @@ class AtomDiffusion(Module):
         sigmas = F.pad(sigmas, (0, 1), value=0.0)  # last step is sigma value of 0.
         return sigmas
 
+    # What gets called by boltz1.py during inference.
     def sample(
         self,
         atom_mask,
