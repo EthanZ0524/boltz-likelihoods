@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import sqrt
+from math import sqrt, ceil
 
 import torch
 import torch.nn.functional as F
@@ -177,6 +177,16 @@ class DiffusionModule(Module):
         multiplicity=1,
         model_cache=None,
     ):
+        """Computes the noise.
+
+        Parameters
+        ----------
+        s_inputs : torch.tensor of shape ()
+        s_trunk : torch.tensor of shape ()
+        z_trunk : torch.tensor of shape (n_tokens, n_tokens, c_z)
+        relative_position_encoding : torch.tensor of shape (n_tokens, n_tokens, c_z)
+        
+        """
         s, normed_fourier = self.single_conditioner(
             times=times,
             s_trunk=s_trunk.repeat_interleave(multiplicity, 0),
@@ -347,6 +357,7 @@ class AtomDiffusion(Module):
         accumulate_token_repr : bool, optional
             Whether to accumulate the token representation, by default False.
 
+        Defaults set in BoltzDiffusionParams.
         """
         super().__init__()
         self.score_model = DiffusionModule(
@@ -408,7 +419,33 @@ class AtomDiffusion(Module):
         network_condition_kwargs: dict,
         training: bool = True,
     ):
+        """Outer layer of per-step diffusion noise prediction. 
+
+        Gets called at every diffusion step by AtomDiffusion.sample(). 
+        Performs some data processing and then calls the actual noise
+        prediction network's forward function. 
+
+        Parameters
+        ----------
+        noised_atom_coords : torch.tensor of shape ()
+
+        sigma : float
+            t_hat (sigma_tm * (gamma + 1)) during inference, 
+            padded_sigmas during training.
+            Noise schedules for training and inference are very
+            different. See page 24 of supps.
+
+        network_condition_args : dict
+            multiplicity : 
+            
+            model_cache :
+
+            Additionally contains s_trunk, z_trunk, s_inputs, feats, and  
+            relative_position_encoding (see AtomDiffusion.sample() 
+            docstring).
+        """
         batch, device = noised_atom_coords.shape[0], noised_atom_coords.device
+        # Batch might be 5?
 
         if isinstance(sigma, float):
             sigma = torch.full((batch,), sigma, device=device)
@@ -417,7 +454,7 @@ class AtomDiffusion(Module):
 
         # Should be looking closely at this.
         net_out = self.score_model(
-            r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
+            r_noisy=self.c_in(padded_sigma) * noised_atom_coords, # 'Dimensionless' scaling, algorithm 20 step 2
             times=self.c_noise(sigma),
             **network_condition_kwargs,
         )
@@ -429,8 +466,14 @@ class AtomDiffusion(Module):
         return denoised_coords, net_out["token_a"]
 
     def sample_schedule(self, num_sampling_steps=None):
+        """AF3 diffusion noise scheduler. See pg. 24 of AF3 supps. 
+
+        Returns
+        -------
+        sigmas : torch.tensor of shape (num_sampling_steps, )
+        """
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
-        inv_rho = 1 / self.rho
+        inv_rho = 1 / self.rho # 1/7 by default.
 
         steps = torch.arange(
             num_sampling_steps, device=self.device, dtype=torch.float32
@@ -442,12 +485,11 @@ class AtomDiffusion(Module):
             * (self.sigma_min**inv_rho - self.sigma_max**inv_rho)
         ) ** self.rho
 
-        sigmas = sigmas * self.sigma_data
+        sigmas = sigmas * self.sigma_data # self.sigma_data is 16 by default.
 
         sigmas = F.pad(sigmas, (0, 1), value=0.0)  # last step is sigma value of 0.
         return sigmas
 
-    # What gets called by boltz1.py during inference.
     def sample(
         self,
         atom_mask,
@@ -458,6 +500,34 @@ class AtomDiffusion(Module):
         steering_args=None,
         **network_condition_kwargs,
     ):
+        """Conditioned diffusion rollout for Boltz structure prediction.
+
+        Gets called within Boltz1's forward pass following the 
+        Pairformer stack.
+
+        Parameters
+        ----------
+        atom_mask : torch.tensor of shape (1, padded_n_atoms)
+            padded_n_atoms = ceil(n_atoms / atoms_per_window_queries)).
+
+        \\*\\*network_condition_kwargs : dict
+            s_trunk : torch.tensor of shape (1, n_tokens, c_s)
+                Post-trunk token-level sequence representation. 
+                c_s = 384
+
+            z_trunk : torch.tensor of shape (1, n_tokens, n_tokens, c_z)
+                Post-trunk token-level pairwise representation. 
+                c_z = 128
+
+            s_inputs : torch.tensor of shape (1, n_tokens, c_s) ?
+                Pre-trunk token-level sequence representation?
+
+            relative_position_encoding : torch.tensor of shape (1, 
+            n_tokens, n_tokens, c_z) ?
+                Pairwise relative token encodings.
+
+            feats : dict
+        """
         if steering_args is not None and (steering_args["fk_steering"] or steering_args["guidance_update"]):
             potentials = get_potentials()
         if steering_args is not None and steering_args["fk_steering"]:
@@ -473,41 +543,46 @@ class AtomDiffusion(Module):
                 device=self.device,
             )
 
-        num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+        num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps) # 200 by default.
+        atom_mask = atom_mask.repeat_interleave(multiplicity, 0) # (multiplicity, next multiple of 32)
 
         shape = (*atom_mask.shape, 3)
-        token_repr_shape = (multiplicity, network_condition_kwargs['feats']['token_index'].shape[1], 2 * self.token_s)
+        token_repr_shape = (multiplicity, network_condition_kwargs['feats']['token_index'].shape[1], 2 * self.token_s) 
+        # (multiplicity, n_tokens, 2 * 384)
 
-        # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
+        # get the schedule, which is returned as (sigma, num_sampling_stepsgamma) tuple, and pair up with the next sigma and gamma
         sigmas = self.sample_schedule(num_sampling_steps)
-        gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
+        gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
 
         # atom position is noise at the beginning
-        init_sigma = sigmas[0]
-        atom_coords = init_sigma * torch.randn(shape, device=self.device)
+        init_sigma = sigmas[0] # Highest noise level.
+        atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, padded_n_atoms, 3)
         atom_coords_denoised = None
         model_cache = {} if self.use_inference_model_cache else None
 
         token_repr = None
         token_a = None
 
-        # gradually denoise
+        # gradually denoise. sigma_tm 'lags behind' sigma_t by one.
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
             random_R, random_tr = compute_random_augmentation(
                 multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
             )
-            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
+            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True) # Centering to origin.
             atom_coords = (
                 torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
             )
-            if atom_coords_denoised is not None:
-                atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)
-                atom_coords_denoised = (
-                    torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
-                    + random_tr
-                )
+            # TODO: I don't think this block accomplishes anything as 
+            # atom_coords_denoised is set to 0 in the line after the
+            # torch.no_grad() line. Can this be removed?
+            # if atom_coords_denoised is not None: 
+            #     atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)
+            #     atom_coords_denoised = (
+            #         torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
+            #         + random_tr
+            #     )
+
             if steering_args is not None and steering_args["guidance_update"] and scaled_guidance_update is not None:
                 scaled_guidance_update = torch.einsum(
                     "bmd,bds->bms", scaled_guidance_update, random_R
@@ -515,11 +590,14 @@ class AtomDiffusion(Module):
 
             sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
 
+            # Gamma upscales t_hat in earlier reverse diffusion steps and 
+            # downscales it deeper into the reverse diffusion.
+            # Algorithm 18.
             t_hat = sigma_tm * (1 + gamma)
             steering_t = 1.0 - (step_idx / num_sampling_steps)
-            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
+            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2) # noise_scale=1.003
             eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
-            atom_coords_noisy = atom_coords + eps
+            atom_coords_noisy = atom_coords + eps # eps is xi in AF3. 
 
             with torch.no_grad():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
@@ -527,7 +605,7 @@ class AtomDiffusion(Module):
 
                 sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
                 sample_ids_chunks = sample_ids.chunk(
-                    multiplicity % max_parallel_samples + 1
+                    ceil(multiplicity / max_parallel_samples)
                 )
                 for sample_ids_chunk in sample_ids_chunks:
                     atom_coords_denoised_chunk, token_a_chunk = \
@@ -543,6 +621,10 @@ class AtomDiffusion(Module):
                         )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
                     token_a[sample_ids_chunk] = token_a_chunk
+                
+                # After the for loop, we have:
+                # atom_coords_denoised : torch.tensor of shape (multiplicity, n_padded_atoms, 3)
+                # token_a : torch.tensor of shape (multiplicity, n_tokens, 2 * 384)
 
                 if steering_args is not None and steering_args["fk_steering"] and (
                     (
@@ -680,7 +762,7 @@ class AtomDiffusion(Module):
 
                 atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
 
-            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
+            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat # delta in algorithm 18 step 9.
             atom_coords_next = (
                 atom_coords_noisy
                 + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
@@ -736,7 +818,7 @@ class AtomDiffusion(Module):
         )
 
         noise = torch.randn_like(atom_coords)
-        noised_atom_coords = atom_coords + padded_sigmas * noise
+        noised_atom_coords = atom_coords + padded_sigmas * noise # (padded_sigmas ** 2 * I)
 
         denoised_atom_coords, _ = self.preconditioned_network_forward(
             noised_atom_coords,

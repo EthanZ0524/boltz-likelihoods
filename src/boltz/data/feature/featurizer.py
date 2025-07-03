@@ -635,7 +635,7 @@ def process_token_features(
     pocket_feature = one_hot(pocket_feature, num_classes=len(const.pocket_contact_info))
 
     # Pad to max tokens if given
-    if max_tokens is not None:
+    if max_tokens is not None: # None by default.
         pad_len = max_tokens - len(token_data)
         if pad_len > 0:
             token_index = pad_dim(token_index, 0, pad_len)
@@ -850,7 +850,7 @@ def process_atom_features(
     if max_atoms is not None:
         assert max_atoms % atoms_per_window_queries == 0
         pad_len = max_atoms - len(atom_data)
-    else:
+    else: # This is the case which is used by default.
         pad_len = (
             (len(atom_data) - 1) // atoms_per_window_queries + 1
         ) * atoms_per_window_queries - len(atom_data)

@@ -906,7 +906,7 @@ def cli() -> None:
     help="The number of diffusion samples to use for affinity prediction. Default is 5.",
     default=5,
 )
-@click.option(
+@click.option( # Why does this default to Boltz-1 if the default model is Boltz-2?
     "--affinity_checkpoint",
     type=click.Path(exists=True),
     help="An optional checkpoint, will use the provided Boltz-1 model by default.",

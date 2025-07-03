@@ -160,15 +160,15 @@ class Boltz1(LightningModule):
 
         # Input embeddings
         full_embedder_args = {
-            "atom_s": atom_s,
-            "atom_z": atom_z,
-            "token_s": token_s,
-            "token_z": token_z,
-            "atoms_per_window_queries": atoms_per_window_queries,
-            "atoms_per_window_keys": atoms_per_window_keys,
-            "atom_feature_dim": atom_feature_dim,
-            "no_atom_encoder": no_atom_encoder,
-            **embedder_args,
+            "atom_s": atom_s, # default=128
+            "atom_z": atom_z, # default=16
+            "token_s": token_s, # default=384
+            "token_z": token_z, # default=128
+            "atoms_per_window_queries": atoms_per_window_queries, # default=32
+            "atoms_per_window_keys": atoms_per_window_keys, # default=128
+            "atom_feature_dim": atom_feature_dim, # default=389
+            "no_atom_encoder": no_atom_encoder, # default=False
+            **embedder_args, # atom_encoder_depth=3, atom_encoder_heads=4
         }
         self.input_embedder = InputEmbedder(**full_embedder_args)
         self.rel_pos = RelativePositionEncoder(token_z)
@@ -271,7 +271,7 @@ class Boltz1(LightningModule):
 
     def forward(
         self,
-        feats: dict[str, Tensor], # Input tensor dict (passed in by predict_step)
+        feats: dict[str, Tensor],
         recycling_steps: int = 0,
         num_sampling_steps: Optional[int] = None,
         multiplicity_diffusion_train: int = 1,
@@ -279,6 +279,24 @@ class Boltz1(LightningModule):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
+        """Second-outermost layer of Boltz-1 inference.
+
+        Carries out the entire inference pipeline (input preparation, 
+        Pairformer, and structure prediction diffusion). 
+
+        Parameters
+        ----------
+        feats : dict
+            Featire dict passed in by predict_step used to create 
+            initial embeddings to pass into Pairformer.
+        
+        num_sampling_steps : int, defaut=200 (set in main.py)
+
+        diffusion_samples : int, default=1 (set in main.py)
+
+        max_parallel_samples : int, default=5 (set in main.py)
+            For memory/efficiency purposes.
+        """
         dict_out = {}
 
         # Compute input embeddings
@@ -338,6 +356,8 @@ class Boltz1(LightningModule):
                         pair_mask=pair_mask,
                         use_kernels=self.use_kernels,
                     )
+                    # s: torch.tensor of shape (1, n_tokens, c_s (384))
+                    # z: torch.tensor of shape (1, n_tokens, n_tokens, c_z (128))
 
             pdistogram = self.distogram_module(z)
             dict_out = {"pdistogram": pdistogram}
@@ -355,12 +375,11 @@ class Boltz1(LightningModule):
                 )
             )
 
-        # Diffusion step. 
-        # Does Boltz not use the atom-level sequence representation for the 
-        # diffusion step?
+        # Inference structure prediction diffusion steps. 
+        # -------------------------------------------------------------------- #
         if (not self.training) or self.confidence_prediction:
             dict_out.update(
-                self.structure_module.sample(
+                self.structure_module.sample( # boltz.model.modules.diffusion.AtomDiffusion
                     s_trunk=s, # Post-trunk token-level sequence.
                     z_trunk=z, # Post-trunk token-level pairs.
                     s_inputs=s_inputs, # Pre-trunk token-level sequence.
@@ -368,7 +387,7 @@ class Boltz1(LightningModule):
                     relative_position_encoding=relative_position_encoding,
                     num_sampling_steps=num_sampling_steps,
                     atom_mask=feats["atom_pad_mask"],
-                    multiplicity=diffusion_samples, # Num. samples to generate (?)
+                    multiplicity=diffusion_samples, # Num. samples to generate
                     max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
                     steering_args=self.steering_args,
@@ -1149,8 +1168,11 @@ class Boltz1(LightningModule):
         )
         self.best_rmsd.reset()
 
-    # What we're going to be working with.
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:
+        """The outermost layer of Boltz-1 inference.
+
+        Simply calls Boltz-1's forward function and returns results.
+        """
         try:
             out = self(
                 batch, # Dict of input tensors outputted by BoltzFeaturizer.
