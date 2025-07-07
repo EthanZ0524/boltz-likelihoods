@@ -74,7 +74,7 @@ class BoltzWriter(BasePredictionWriter):
             idx_to_rank = {idx.item(): rank for rank, idx in enumerate(argsort)}
         # Handles cases where confidence summary is False
         else:
-            idx_to_rank = {i: i for i in range(len(records))}
+            idx_to_rank = {i: i for i in range(len(prediction["coords"]))}
 
         # Iterate over the records
         for record, coord, pad_mask in zip(records, coords, pad_masks):
