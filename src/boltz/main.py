@@ -780,10 +780,34 @@ def cli() -> None:
     default=3,
 )
 @click.option(
-    "--sampling_steps",
+    "--diffusion_sampling_steps",
     type=int,
     help="The number of sampling steps to use for prediction. Default is 200.",
     default=200,
+)
+@click.option(
+    "--diffusion_stop",
+    type=int,
+    help="The low-temperature step to stop the diffusion rollout at for LTLS.",
+    default=195,
+)
+@click.option(
+    "--langevin_sampling_steps",
+    type=int,
+    help="The number of Langevin sampling steps to do.",
+    default=5000,
+)
+@click.option(
+    "--langevin",
+    type=bool,
+    help="Whether to do Langevin sampling instead of folding. Default is False.",
+    default=False
+)
+@click.option(
+    "--langevin_eps",
+    type=float,
+    help="Epsilon value for Langevin sampling noise.",
+    default=1e-3
 )
 @click.option(
     "--diffusion_samples",
@@ -934,6 +958,12 @@ def cli() -> None:
     is_flag=True,
     help="Whether to disable the kernels. Default False",
 )
+@click.option(
+    "--confidence",
+    type=bool,
+    help="Whether to do confidence prediction. Default is True.",
+    default=True
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -943,7 +973,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     devices: int = 1,
     accelerator: str = "gpu",
     recycling_steps: int = 3,
-    sampling_steps: int = 200,
+    diffusion_sampling_steps: int = 200,
+    diffusion_stop: int = 195,
+    langevin_sampling_steps: int = 5000,
+    langevin_eps: float = 1e-3,
     diffusion_samples: int = 1,
     sampling_steps_affinity: int = 200,
     diffusion_samples_affinity: int = 3,
@@ -967,6 +1000,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
+    langevin: bool = False,
+    confidence: bool = True
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1164,12 +1199,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             else:
                 checkpoint = cache / "boltz1_conf.ckpt"
 
+        print('CONFIDENCE VALUE: ', confidence)
         predict_args = {
             "recycling_steps": recycling_steps,
-            "sampling_steps": sampling_steps,
+            "sampling_steps": diffusion_sampling_steps,
             "diffusion_samples": diffusion_samples,
             "max_parallel_samples": max_parallel_samples,
-            "write_confidence_summary": True,
+            "write_confidence_summary": confidence,
             "write_full_pae": write_full_pae,
             "write_full_pde": write_full_pde,
         }
@@ -1181,7 +1217,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         model_cls = Boltz2 if model == "boltz2" else Boltz1
         model_module = model_cls.load_from_checkpoint(
             checkpoint,
-            strict=True,
+            strict=False,
             predict_args=predict_args,
             map_location="cpu",
             diffusion_process_args=asdict(diffusion_params),
@@ -1190,8 +1226,26 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
+            confidence_prediction=confidence
         )
         model_module.eval()
+
+        if langevin:
+            # Checking argument incompatibilities.
+            assert diffusion_sampling_steps > diffusion_stop, (
+                f"diffusion_sampling_steps must be larger than"
+                f" diffusion_stop, but diffusion_sampling_steps is "
+                f" {diffusion_sampling_steps} and diffusion_stop is "
+                f" {diffusion_stop}."
+            ) 
+
+            langevin_args = {
+                "diffusion_stop": diffusion_stop,
+                "langevin_sampling_steps": langevin_sampling_steps,
+                "langevin_eps": langevin_eps,
+                "outdir": out_dir / "trajectories"
+            }
+            model_module.langevin_args = langevin_args
 
         # Compute structure predictions
         trainer.predict(
