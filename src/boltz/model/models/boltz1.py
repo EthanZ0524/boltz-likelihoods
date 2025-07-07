@@ -261,6 +261,9 @@ class Boltz1(LightningModule):
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
+        # Langevin args
+        self.langevin_args = None
+
     def setup(self, stage: str) -> None:
         """Set the model for training, validation and inference."""
         if stage == "predict" and not (
@@ -288,7 +291,8 @@ class Boltz1(LightningModule):
         ----------
         feats : dict
             Featire dict passed in by predict_step used to create 
-            initial embeddings to pass into Pairformer.
+            initial embeddings to pass into Pairformer. Named 'batch'
+            in self.predict().
         
         num_sampling_steps : int, defaut=200 (set in main.py)
 
@@ -375,9 +379,27 @@ class Boltz1(LightningModule):
                 )
             )
 
+        # Inference Langevin steps.
+        # -------------------------------------------------------------------- #
+        if self.langevin_args:
+            dict_out.update(
+                self.structure_module.langevin(
+                    s_trunk=s,
+                    z_trunk=z,
+                    s_inputs=s_inputs, # Pre-trunk token-level sequence.
+                    feats=feats,
+                    relative_position_encoding=relative_position_encoding,
+                    diffusion_sampling_steps=num_sampling_steps,
+                    atom_mask=feats["atom_pad_mask"],
+                    multiplicity=diffusion_samples, # Num. samples to generate
+                    max_parallel_samples=max_parallel_samples,
+                    langevin_args=self.langevin_args
+                )
+            )
+
         # Inference structure prediction diffusion steps. 
         # -------------------------------------------------------------------- #
-        if (not self.training) or self.confidence_prediction:
+        elif (not self.training) or self.confidence_prediction:
             dict_out.update(
                 self.structure_module.sample( # boltz.model.modules.diffusion.AtomDiffusion
                     s_trunk=s, # Post-trunk token-level sequence.
@@ -1173,6 +1195,9 @@ class Boltz1(LightningModule):
 
         Simply calls Boltz-1's forward function and returns results.
         """
+        if self.langevin_args:
+            record = batch["record"][batch_idx]
+            self.langevin_args.update({"record_id": record.id})
         try:
             out = self(
                 batch, # Dict of input tensors outputted by BoltzFeaturizer.
@@ -1185,6 +1210,7 @@ class Boltz1(LightningModule):
             pred_dict = {"exception": False}
             pred_dict["masks"] = batch["atom_pad_mask"]
             pred_dict["coords"] = out["sample_atom_coords"]
+            print('TEST: ', self.predict_args.get('write_confidence_summary'))
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
                     4 * out["complex_plddt"]
