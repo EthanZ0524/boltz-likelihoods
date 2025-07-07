@@ -37,6 +37,11 @@ from boltz.model.modules.utils import (
 )
 from boltz.model.potentials.potentials import get_potentials
 
+import h5py
+import os
+
+from tqdm import tqdm
+
 # Boltz diffusion's score network.
 class DiffusionModule(Module):
     """Diffusion module"""
@@ -186,6 +191,10 @@ class DiffusionModule(Module):
         z_trunk : torch.tensor of shape (n_tokens, n_tokens, c_z)
         relative_position_encoding : torch.tensor of shape (n_tokens, n_tokens, c_z)
         
+        Returns
+        -------
+        r_update : torch.tensor of shape ()
+
         """
         s, normed_fourier = self.single_conditioner(
             times=times,
@@ -421,13 +430,17 @@ class AtomDiffusion(Module):
     ):
         """Outer layer of per-step diffusion noise prediction. 
 
-        Gets called at every diffusion step by AtomDiffusion.sample(). 
-        Performs some data processing and then calls the actual noise
-        prediction network's forward function. 
+        Gets called at every diffusion step by AtomDiffusion.sample() 
+        as well as for training. Does some input prep - prepares the 
+        'dimensionless' version of the noised coordinates and the 
+        scaled t-hat/sigma used to create the Fourier time embedding. 
 
         Parameters
         ----------
-        noised_atom_coords : torch.tensor of shape ()
+        noised_atom_coords : torch.tensor of shape (chunk_size, 
+        padded_n_atoms, 3)
+            A 'chunk' of noised atom coordinates (several samples taken)
+            from the 0th (multiplicity) dimension.
 
         sigma : float
             t_hat (sigma_tm * (gamma + 1)) during inference, 
@@ -436,16 +449,25 @@ class AtomDiffusion(Module):
             different. See page 24 of supps.
 
         network_condition_args : dict
-            multiplicity : 
+            multiplicity : int
+                The number of diffusion samples.
             
-            model_cache :
+            model_cache : dict
+                # TODO: can we remove this? It's supplied as a parameter
+                but the function doesn't even use it
 
             Additionally contains s_trunk, z_trunk, s_inputs, feats, and  
             relative_position_encoding (see AtomDiffusion.sample() 
             docstring).
+
+        Returns
+        -------
+        denoised_coords : torch.tensor of shape (chunk_size, 
+        padded_n_atoms, 3)
+            Model prediction of a chunk of fully denoised coordinates at
+            'timestep' sigma, conditioned on network_condition_args.
         """
         batch, device = noised_atom_coords.shape[0], noised_atom_coords.device
-        # Batch might be 5?
 
         if isinstance(sigma, float):
             sigma = torch.full((batch,), sigma, device=device)
@@ -454,15 +476,15 @@ class AtomDiffusion(Module):
 
         # Should be looking closely at this.
         net_out = self.score_model(
-            r_noisy=self.c_in(padded_sigma) * noised_atom_coords, # 'Dimensionless' scaling, algorithm 20 step 2
-            times=self.c_noise(sigma),
+            r_noisy=self.c_in(padded_sigma) * noised_atom_coords, # 'Dimensionless' scaling, algorithm 20 step 2.
+            times=self.c_noise(sigma), # Algorithm 21 step 8.
             **network_condition_kwargs,
         )
 
         denoised_coords = (
             self.c_skip(padded_sigma) * noised_atom_coords
             + self.c_out(padded_sigma) * net_out["r_update"]
-        )
+        ) # Algorithm 20 step 8.
         return denoised_coords, net_out["token_a"]
 
     def sample_schedule(self, num_sampling_steps=None):
@@ -489,7 +511,186 @@ class AtomDiffusion(Module):
 
         sigmas = F.pad(sigmas, (0, 1), value=0.0)  # last step is sigma value of 0.
         return sigmas
+    
+    def langevin(
+        self,
+        atom_mask,
+        diffusion_sampling_steps=None,
+        multiplicity=1,
+        max_parallel_samples=None,
+        langevin_args=None,
+        **network_condition_kwargs,
+    ):
+        """Low-temp Langevin sampling using conditioned score model.
 
+        Parameters
+        ----------
+        langevin_args : dict
+            langevin_sampling_steps : int
+                The number of Langevin dynamics steps to take using
+                the conditioned score model.
+            diffusion_stop : int
+                The step number of the diffusion rollout where diffusion
+                stops and Langevin sampling begins.
+            l_eps : float
+                The noise scale to use during Langevin sampling.
+            outdir : str
+                The directory at which to store trajectories.
+            record_id : str
+                Name of inference record (yaml or fasta filename stem).
+
+        Notes
+        -----
+        Unlike all other outputs which are written to disk by the
+        prediction writer post-inference, Langevin trajectories are
+        saved on the fly to prevent having to keep large trajectory 
+        tensors in memory.
+        """
+        diffusion_stop = langevin_args["diffusion_stop"]
+        langevin_sampling_steps = langevin_args["langevin_sampling_steps"]
+        l_eps = langevin_args["langevin_eps"]
+        record_id = langevin_args["record_id"]
+        outdir = langevin_args["outdir"]
+
+        diffusion_sampling_steps = default(diffusion_sampling_steps, self.num_sampling_steps) # 200 by default.
+        atom_mask = atom_mask.repeat_interleave(multiplicity, 0) # (multiplicity, next multiple of 32)
+
+        shape = (*atom_mask.shape, 3)
+
+        # get the schedule, which is returned as (sigma, num_sampling_stepsgamma) tuple, and pair up with the next sigma and gamma
+        sigmas = self.sample_schedule(diffusion_sampling_steps)
+        gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
+
+        # atom position is noise at the beginning
+        init_sigma = sigmas[0] # Highest noise level.
+        atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, padded_n_atoms, 3)
+        atom_coords_denoised = None
+        model_cache = {} if self.use_inference_model_cache else None
+
+        # gradually denoise. sigma_tm 'lags behind' sigma_t by one.
+        for sigma_tm, sigma_t, gamma in sigmas_and_gammas[:diffusion_stop]: # Only doing diffusion_stop steps of diffusion rollout.
+            random_R, random_tr = compute_random_augmentation(
+                multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
+            )
+            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True) # Centering to origin.
+            atom_coords = (
+                torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
+            )
+
+            sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
+
+            # Gamma upscales t_hat in earlier reverse diffusion steps and 
+            # downscales it deeper into the reverse diffusion.
+            # Algorithm 18.
+            t_hat = sigma_tm * (1 + gamma)
+            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2) # noise_scale=1.003
+            eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
+            atom_coords_noisy = atom_coords + eps # eps is xi in AF3. 
+
+            with torch.no_grad():
+                atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
+
+                sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
+                sample_ids_chunks = sample_ids.chunk(
+                    ceil(multiplicity / max_parallel_samples)
+                )
+                for sample_ids_chunk in sample_ids_chunks:
+                    atom_coords_denoised_chunk, _ = \
+                          self.preconditioned_network_forward(
+                              atom_coords_noisy[sample_ids_chunk],
+                              t_hat,
+                              training=False,
+                              network_condition_kwargs=dict(
+                                multiplicity=sample_ids_chunk.numel(),
+                                model_cache=model_cache,
+                                **network_condition_kwargs,
+                            ),
+                        )
+                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+
+            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat # delta in algorithm 18 step 9.
+            atom_coords_next = (
+                atom_coords_noisy
+                + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
+            )
+
+            atom_coords = atom_coords_next
+
+        # atom_coords : torch.tensor of shape (multiplicity, n_padded_atoms, 3) 
+        # The final, nearly-denoised coordinate set.
+
+        # Langevin dynamics procedure.
+        # -------------------------------------------------------------------- #
+        atom_coords_curr = atom_coords.clone()
+        atom_coords_shape = atom_coords_curr.shape
+
+        sigma_tm, _, gamma = sigmas_and_gammas[diffusion_stop]
+        sigma_tm, gamma = sigma_tm.item(), gamma.item()
+        t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
+
+        traj_dir = (outdir / record_id).expanduser().resolve(strict=False)
+        traj_dir.mkdir(parents=True, exist_ok=True)        
+        with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "w") as f:
+            traj_dset = f.create_dataset(
+                "traj",
+                shape=(0, *atom_coords_shape),
+                maxshape=(None, *atom_coords_shape),
+                dtype='float32',
+                chunks=(1, *atom_coords_shape)
+            )
+
+            score_dset = f.create_dataset(
+                "scores",
+                shape=(0, *atom_coords_shape),
+                maxshape=(None, *atom_coords_shape),
+                dtype='float32',
+                chunks=(1, *atom_coords_shape)
+            )
+
+            for _ in tqdm(
+                range(langevin_sampling_steps), 
+                desc='Langevin steps',
+                mininterval=10
+            ):
+                # Compute the score.
+                atom_coords_denoised = torch.zeros_like(atom_coords_curr)
+                sample_ids = torch.arange(multiplicity).to(atom_coords_curr.device)
+                sample_ids_chunks = sample_ids.chunk(
+                    ceil(multiplicity / max_parallel_samples)
+                )
+                for sample_ids_chunk in sample_ids_chunks:
+                    atom_coords_denoised_chunk, _ = \
+                            self.preconditioned_network_forward(
+                                atom_coords_curr[sample_ids_chunk],
+                                t_hat,
+                                training=False,
+                                network_condition_kwargs=dict(
+                                multiplicity=sample_ids_chunk.numel(),
+                                model_cache=model_cache,
+                                **network_condition_kwargs,
+                            ),
+                        )
+                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+
+                score = (atom_coords_denoised - atom_coords_curr) / (t_hat ** 2)
+
+                # Perform the Langevin update. 
+                noise = sqrt(2 * l_eps) * torch.randn(atom_coords_shape, device=self.device)
+                atom_coords_next = atom_coords_curr + l_eps * score + noise
+
+                # Write the score + coordinates and update.
+                coords_np = atom_coords_next.cpu().numpy()
+                traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
+                traj_dset[-1, :, :, :] = coords_np
+
+                score_np = score.cpu().numpy()
+                score_dset.resize(score_dset.shape[0] + 1, axis=0)
+                score_dset[-1, :, :, :] = score_np
+                atom_coords_curr = atom_coords_next
+                
+        return dict(sample_atom_coords=atom_coords) # Want to save initial seed structures.
+    
     def sample(
         self,
         atom_mask,
