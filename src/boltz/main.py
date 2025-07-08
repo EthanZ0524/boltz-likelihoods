@@ -964,6 +964,12 @@ def cli() -> None:
     help="Whether to do confidence prediction. Default is True.",
     default=True
 )
+@click.option(
+    "--experiment_name",
+    type=str,
+    help="Experiment name for outdir naming.",
+    default=None
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1001,7 +1007,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     langevin: bool = False,
-    confidence: bool = True
+    confidence: bool = True,
+    experiment_name: str = None
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1039,7 +1046,11 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Create output directories
     data = Path(data).expanduser()
     out_dir = Path(out_dir).expanduser()
-    out_dir = out_dir / f"boltz_results_{data.stem}"
+
+    if experiment_name:
+        out_dir = out_dir / f"boltz_results_{experiment_name}"
+    else:
+        out_dir = out_dir / f"boltz_results_{data.stem}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Download necessary data and model
@@ -1199,7 +1210,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             else:
                 checkpoint = cache / "boltz1_conf.ckpt"
 
-        print('CONFIDENCE VALUE: ', confidence)
         predict_args = {
             "recycling_steps": recycling_steps,
             "sampling_steps": diffusion_sampling_steps,
