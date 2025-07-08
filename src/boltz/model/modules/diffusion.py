@@ -625,6 +625,10 @@ class AtomDiffusion(Module):
         atom_coords_curr = atom_coords.clone()
         atom_coords_shape = atom_coords_curr.shape
 
+        atom_coords_unpadded = atom_coords[:, atom_mask[0].bool(), :]
+        atom_coords_unpadded_shape = atom_coords_unpadded.shape
+        print(atom_coords_unpadded_shape)
+
         sigma_tm, _, gamma = sigmas_and_gammas[diffusion_stop]
         sigma_tm, gamma = sigma_tm.item(), gamma.item()
         t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
@@ -634,18 +638,18 @@ class AtomDiffusion(Module):
         with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "w") as f:
             traj_dset = f.create_dataset(
                 "traj",
-                shape=(0, *atom_coords_shape),
-                maxshape=(None, *atom_coords_shape),
+                shape=(0, *atom_coords_unpadded_shape),
+                maxshape=(None, *atom_coords_unpadded_shape), # (None, 5, 96, 3)
                 dtype='float32',
-                chunks=(1, *atom_coords_shape)
+                chunks=(1, *atom_coords_unpadded_shape)
             )
 
             score_dset = f.create_dataset(
                 "scores",
-                shape=(0, *atom_coords_shape),
-                maxshape=(None, *atom_coords_shape),
+                shape=(0, *atom_coords_unpadded_shape),
+                maxshape=(None, *atom_coords_unpadded_shape),
                 dtype='float32',
-                chunks=(1, *atom_coords_shape)
+                chunks=(1, *atom_coords_unpadded_shape)
             )
 
             for _ in tqdm(
@@ -679,12 +683,14 @@ class AtomDiffusion(Module):
                 noise = sqrt(2 * l_eps) * torch.randn(atom_coords_shape, device=self.device)
                 atom_coords_next = atom_coords_curr + l_eps * score + noise
 
-                # Write the score + coordinates and update.
-                coords_np = atom_coords_next.cpu().numpy()
+                # Unpad, write the score + coordinates and update.
+                coords_unpadded = atom_coords_next[:, atom_mask[0].bool(), :]
+                coords_np = coords_unpadded.cpu().numpy()
                 traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
                 traj_dset[-1, :, :, :] = coords_np
 
-                score_np = score.cpu().numpy()
+                score_unpadded = score[:, atom_mask[0].bool(), :]
+                score_np = score_unpadded.cpu().numpy()
                 score_dset.resize(score_dset.shape[0] + 1, axis=0)
                 score_dset[-1, :, :, :] = score_np
                 atom_coords_curr = atom_coords_next
