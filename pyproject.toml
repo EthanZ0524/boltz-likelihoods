@@ -40,6 +40,8 @@ dependencies = [
     "tqdm>=4.67.1",
     "openmm>=8.3.0",
     "h5py>=3.14.0",
+    "matplotlib>=3.10.3",
+    "parmed>=4.3.0",
 ]
 
 [project.scripts]
