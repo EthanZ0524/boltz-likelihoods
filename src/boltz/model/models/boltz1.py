@@ -1210,7 +1210,6 @@ class Boltz1(LightningModule):
             pred_dict = {"exception": False}
             pred_dict["masks"] = batch["atom_pad_mask"]
             pred_dict["coords"] = out["sample_atom_coords"]
-            print('TEST: ', self.predict_args.get('write_confidence_summary'))
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
                     4 * out["complex_plddt"]
