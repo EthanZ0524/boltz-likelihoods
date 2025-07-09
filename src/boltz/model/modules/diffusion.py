@@ -532,7 +532,9 @@ class AtomDiffusion(Module):
             diffusion_stop : int
                 The step number of the diffusion rollout where diffusion
                 stops and Langevin sampling begins.
-            l_eps : float
+            langevin_eps : float
+                The step size to use during Langevin sampling.
+            langevin_noise_scale : float
                 The noise scale to use during Langevin sampling.
             outdir : str
                 The directory at which to store trajectories.
@@ -549,6 +551,7 @@ class AtomDiffusion(Module):
         diffusion_stop = langevin_args["diffusion_stop"]
         langevin_sampling_steps = langevin_args["langevin_sampling_steps"]
         l_eps = langevin_args["langevin_eps"]
+        langevin_noise_scale = langevin_args["langevin_noise_scale"]
         record_id = langevin_args["record_id"]
         outdir = langevin_args["outdir"]
 
@@ -635,53 +638,63 @@ class AtomDiffusion(Module):
 
         traj_dir = (outdir / record_id).expanduser().resolve(strict=False)
         traj_dir.mkdir(parents=True, exist_ok=True)        
-        with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "w") as f:
-            traj_dset = f.create_dataset(
-                "traj",
-                shape=(0, *atom_coords_unpadded_shape),
-                maxshape=(None, *atom_coords_unpadded_shape), # (None, 5, 96, 3)
-                dtype='float32',
-                chunks=(1, *atom_coords_unpadded_shape)
+
+        for _ in tqdm(
+            range(langevin_sampling_steps), 
+            desc='Langevin steps',
+            mininterval=10
+        ):
+            # Compute the score.
+            atom_coords_denoised = torch.zeros_like(atom_coords_curr)
+            sample_ids = torch.arange(multiplicity).to(atom_coords_curr.device)
+            sample_ids_chunks = sample_ids.chunk(
+                ceil(multiplicity / max_parallel_samples)
             )
+            for sample_ids_chunk in sample_ids_chunks:
+                atom_coords_denoised_chunk, _ = \
+                        self.preconditioned_network_forward(
+                            atom_coords_curr[sample_ids_chunk],
+                            t_hat,
+                            training=False,
+                            network_condition_kwargs=dict(
+                            multiplicity=sample_ids_chunk.numel(),
+                            model_cache=model_cache,
+                            **network_condition_kwargs,
+                        ),
+                    )
+                atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
 
-            score_dset = f.create_dataset(
-                "scores",
-                shape=(0, *atom_coords_unpadded_shape),
-                maxshape=(None, *atom_coords_unpadded_shape),
-                dtype='float32',
-                chunks=(1, *atom_coords_unpadded_shape)
+            score = (atom_coords_denoised - atom_coords_curr) / (t_hat ** 2)
+
+            # Perform the Langevin update. 
+            noise = (
+                sqrt(2 * l_eps) * langevin_noise_scale 
+                * torch.randn(atom_coords_shape, device=self.device)
             )
+            atom_coords_next = atom_coords_curr + l_eps * score + noise
 
-            for _ in tqdm(
-                range(langevin_sampling_steps), 
-                desc='Langevin steps',
-                mininterval=10
-            ):
-                # Compute the score.
-                atom_coords_denoised = torch.zeros_like(atom_coords_curr)
-                sample_ids = torch.arange(multiplicity).to(atom_coords_curr.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    ceil(multiplicity / max_parallel_samples)
-                )
-                for sample_ids_chunk in sample_ids_chunks:
-                    atom_coords_denoised_chunk, _ = \
-                            self.preconditioned_network_forward(
-                                atom_coords_curr[sample_ids_chunk],
-                                t_hat,
-                                training=False,
-                                network_condition_kwargs=dict(
-                                multiplicity=sample_ids_chunk.numel(),
-                                model_cache=model_cache,
-                                **network_condition_kwargs,
-                            ),
-                        )
-                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+            with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "w") as f:
+                if 'traj' not in f:
+                    traj_dset = f.create_dataset(
+                        "traj",
+                        shape=(0, *atom_coords_unpadded_shape),
+                        maxshape=(None, *atom_coords_unpadded_shape), # (None, 5, 96, 3)
+                        dtype='float32',
+                        chunks=(1, *atom_coords_unpadded_shape)
+                    )
+                else:
+                    traj_dset = f['traj']
 
-                score = (atom_coords_denoised - atom_coords_curr) / (t_hat ** 2)
-
-                # Perform the Langevin update. 
-                noise = sqrt(2 * l_eps) * torch.randn(atom_coords_shape, device=self.device)
-                atom_coords_next = atom_coords_curr + l_eps * score + noise
+                if 'scores' not in f:
+                    score_dset = f.create_dataset(
+                        "scores",
+                        shape=(0, *atom_coords_unpadded_shape),
+                        maxshape=(None, *atom_coords_unpadded_shape),
+                        dtype='float32',
+                        chunks=(1, *atom_coords_unpadded_shape)
+                    )
+                else:
+                    score_dset = f['scores']
 
                 # Unpad, write the score + coordinates and update.
                 coords_unpadded = atom_coords_next[:, atom_mask[0].bool(), :]

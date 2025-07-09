@@ -806,8 +806,14 @@ def cli() -> None:
 @click.option(
     "--langevin_eps",
     type=float,
-    help="Epsilon value for Langevin sampling noise.",
+    help="Step size for Langevin sampling.",
     default=1e-3
+)
+@click.option(
+    "--langevin_noise_scale",
+    type=float,
+    help="Brownian noise scale for Langevin sampling.",
+    default=1.0
 )
 @click.option(
     "--diffusion_samples",
@@ -983,6 +989,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     diffusion_stop: int = 195,
     langevin_sampling_steps: int = 5000,
     langevin_eps: float = 1e-3,
+    langevin_noise_scale: float = 1.0,
     diffusion_samples: int = 1,
     sampling_steps_affinity: int = 200,
     diffusion_samples_affinity: int = 3,
@@ -1253,6 +1260,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 "diffusion_stop": diffusion_stop,
                 "langevin_sampling_steps": langevin_sampling_steps,
                 "langevin_eps": langevin_eps,
+                "langevin_noise_scale": langevin_noise_scale,
                 "outdir": out_dir / "trajectories"
             }
             model_module.langevin_args = langevin_args
