@@ -167,4 +167,3 @@ boltz_results_*/
 # Separate directory to keep all predictions to avoid main directory clutter
 predictions/
 slurm*
-examples/
