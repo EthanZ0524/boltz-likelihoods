@@ -630,11 +630,11 @@ class AtomDiffusion(Module):
 
         atom_coords_unpadded = atom_coords[:, atom_mask[0].bool(), :]
         atom_coords_unpadded_shape = atom_coords_unpadded.shape
-        print(atom_coords_unpadded_shape)
 
         sigma_tm, _, gamma = sigmas_and_gammas[diffusion_stop]
         sigma_tm, gamma = sigma_tm.item(), gamma.item()
         t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
+        print('T_HAT FOR SCORE: ', t_hat)
 
         traj_dir = (outdir / record_id).expanduser().resolve(strict=False)
         traj_dir.mkdir(parents=True, exist_ok=True)        
@@ -673,7 +673,7 @@ class AtomDiffusion(Module):
             )
             atom_coords_next = atom_coords_curr + l_eps * score + noise
 
-            with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "w") as f:
+            with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "a") as f:
                 if 'traj' not in f:
                     traj_dset = f.create_dataset(
                         "traj",
