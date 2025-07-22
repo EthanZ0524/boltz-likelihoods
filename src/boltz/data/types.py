@@ -506,6 +506,7 @@ class ChainInfo:
     num_residues: int
     valid: bool = True
     entity_id: Optional[Union[str, int]] = None
+    sequence: Optional[str] = None
 
 
 @dataclass(frozen=True)
