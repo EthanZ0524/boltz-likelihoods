@@ -1,8 +1,15 @@
 import gc
 import random
+import os
+import h5py
+import mdtraj as md
+import numpy as np
+from pathlib import Path
+import glob
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 import torch._dynamo
 from pytorch_lightning import LightningModule
 from torch import Tensor, nn
@@ -36,6 +43,7 @@ from boltz.model.modules.trunk import (
 from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
+import boltz.data.const
 
 class Boltz1(LightningModule):
     """Boltz1 model."""
@@ -264,6 +272,175 @@ class Boltz1(LightningModule):
         # Langevin args
         self.langevin_args = None
 
+        self.outdir = None
+        self.head_init = None
+        self.save_conditioning_args = False
+        self.mode = 'predict_diff'
+
+    def _load_head_init(
+        self,
+        sequences,
+        atom_mask
+    ):
+        """Helper function to load score conditioning tensors and 
+        process PDB coordinates.
+
+        Parameters
+        ----------
+        sequences : list
+            A list of protein sequences provided in the input yaml.
+
+        atom_mask : torch.tensor of shape ()
+
+        Returns
+        -------
+        s, z, s_inputs, relative_position_encodings : score network 
+        conditioning tensors.
+
+        input_coords : dict
+            Keys: full PDB filepaths. Values: processed coord tensors.
+
+        Notes
+        -----
+        Provided PDB files must exactly match the provided protein 
+        sequence in the yaml with the sole exception that PDB files can
+        contain terminating residues (ACE, NME) not present in the yaml 
+        sequence. If any PDB file doesn't match the yaml sequence, 
+        inferene will be stopped.
+
+        TODO: the PDB processing is quite brittle right now. 
+        Things that need to be addressed: 
+        Does not work with PDBs which contain ligands.
+        Currently assumes single-chain inputs.
+        ACE and NME detection is not robust.
+        """
+        root = self.head_init
+
+        try:
+            with h5py.File(Path(root) / "tensors.hdf5", 'r') as f:
+                s = torch.from_numpy(f['s_trunk'][:]).to(self.device)
+                z = torch.from_numpy(f['z_trunk'][:]).to(self.device)
+                s_inputs = torch.from_numpy(f['s_inputs'][:]).to(self.device)
+                relative_position_encoding = torch.from_numpy(f['rpes'][:]).to(self.device)
+
+        except Exception as e:
+            print(
+                f'The following error occurred when trying to load '
+                f'head_init files: {e}.'
+            )
+                    
+        # Processing PDB for Langevin/likelihoods if provided.
+        pdb_files = glob.glob(os.path.join(root, "*.pdb"))
+        ref_atoms = const.ref_atoms
+        has_ace = False
+
+        yaml_seq = sequences[0] # TODO: assumes that the input is single-chain.
+        yaml_seq_3 = [
+            const.prot_letter_to_token[res] for res in yaml_seq
+        ]
+        mismatch_errors = {}
+
+        # Doing error checks on provided PDB files.
+        for file in sorted(pdb_files):
+            init_pdb = md.load(file)
+            prot = init_pdb.topology.select("protein")
+            pdb = init_pdb.atom_slice(prot)
+            pdb_seq = []
+
+            for i, residue in enumerate(pdb.topology.residues):
+                pdb_seq.append(residue.code)
+
+            # Check if there are any other non-canonical AAs in the PDB.
+            # (Excluding ACE and NME).
+            noncanonical_indices = [
+                i + 1 for i, res in enumerate(pdb_seq) 
+                if res is None and i != 0 and i != (len(pdb_seq) - 1)
+            ] 
+
+            if len(noncanonical_indices) > 0:
+                mismatch_errors[file] = (
+                    f"Noncanonical residues found at the following "
+                    f"indices: {noncanonical_indices}."
+                )
+                continue
+
+            # Removing ACE and NME, if present. # TODO: this is not robust.
+            if pdb_seq[-1] is None:
+                pdb_seq = pdb_seq[:-1]
+
+            if pdb_seq[0] is None:
+                pdb_seq = pdb_seq[1:]
+                has_ace = True
+
+            # If there are no non-canonical AAs and ACE/NMEs are
+            # removed, now, pdb_seq should match exactly with yaml_seq.
+            if "".join(pdb_seq) != yaml_seq:
+                mismatch_errors[file] = (
+                    f"Mismatched sequences."
+                )
+
+        if len(mismatch_errors) != 0:
+            errors = [
+                f"For file {k} the following error occurred: {v}"
+                for k, v in mismatch_errors.items()
+            ]
+            raise Exception("\n".join(errors))
+
+        '''If no errors occurred, we can process PDB coordinates safely.
+        Iterating over the yaml sequence's residues, we use Boltz's 
+        canonical internal ordering to fetch PDB atom coordinates in the 
+        proper order.'''
+        pdb_names = []
+        all_coords = []
+        for file in sorted(pdb_files):
+            init_pdb = md.load(file)
+            prot = init_pdb.topology.select("protein")
+            pdb = init_pdb.atom_slice(prot)
+            coord_list = []
+
+            atom_coords = {
+                str(list(pdb.topology.atoms)[i]): pdb.xyz[0][i] 
+                for i in range(len(pdb.xyz[0]))
+            } # Keys: eg. 'ACE1-H1'. Values: eg. [0.2, 0.3, 0.1]
+
+            start = 2 if has_ace else 1
+            for i, res in enumerate(yaml_seq_3, start=start):
+                boltz_atom_ordering = ref_atoms[res]
+                for atom in boltz_atom_ordering:
+                    atom_fullname = f'{res}{i}-{atom}'
+                    try:
+                        coord_list.append(atom_coords[atom_fullname])
+                    except:
+                        raise Exception(
+                            f'A Boltz canonical atom {str(atom)} is '
+                            f'missing in PDB {file}, residue {res}{i}.'
+                        )
+
+            # Finding the padding dimension for coord_tensor
+            padding_dim = atom_mask.shape[-1]
+            coord_tensor = torch.from_numpy(np.stack(coord_list)).to(self.device)
+            rows_to_pad = padding_dim - coord_tensor.shape[0]
+            if rows_to_pad < 0: # TODO: in principle, this shouldn't be necessary anymore
+                print(
+                    f'Provided PDB {file} has more atoms than the '
+                    f'input conditioning tensors. Skipping.'
+                )
+                continue
+            pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
+            all_coords.append(pdb_coords)
+            pdb_names.append(file)
+        
+        if len(all_coords) > 0:
+            input_coords = {
+                pdb_names[i]: all_coords[i] 
+                for i in range(len(pdb_names))
+            }
+
+        else:
+            input_coords = None
+
+        return s, z, s_inputs, relative_position_encoding, input_coords
+
     def setup(self, stage: str) -> None:
         """Set the model for training, validation and inference."""
         if stage == "predict" and not (
@@ -271,6 +448,38 @@ class Boltz1(LightningModule):
             and torch.cuda.get_device_properties(torch.device("cuda")).major >= 8.0  # noqa: PLR2004
         ):
             self.use_kernels = False
+
+    def likelihood(
+        self,
+        feats, 
+        num_sampling_steps,
+    ):
+        """Outer wrapper of likelihood calculations. 
+        """
+        chains = feats["record"][0].chains
+        sequences = [chain.sequence for chain in chains]
+        (
+            s, 
+            z, 
+            s_inputs, 
+            relative_position_encoding, 
+            input_coords
+        ) = self._load_head_init(sequences, feats["atom_pad_mask"])
+
+        if input_coords is None:
+            raise ValueError(
+                'No input.pdb file was provided.'
+            )
+
+        self.structure_module.calc_likelihoods(
+            s_trunk=s,
+            z_trunk=z,
+            s_inputs=s_inputs, # Pre-trunk token-level sequence.
+            feats=feats,
+            relative_position_encoding=relative_position_encoding,
+            diffusion_sampling_steps=num_sampling_steps,
+            input_coords=input_coords
+        )
 
     def forward(
         self,
@@ -282,10 +491,18 @@ class Boltz1(LightningModule):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
-        """Second-outermost layer of Boltz-1 inference.
+        """Handles inference logic.
 
-        Carries out the entire inference pipeline (input preparation, 
-        Pairformer, and structure prediction diffusion). 
+        Three inference modes are available - structure prediction with
+        diffusion sampling, structure prediction using PFODE, and  
+        Langevin sampling.
+         
+        The entire inference pipeline (input preparation, 
+        Pairformer, and mode-specific head) can be run. Alternatively, 
+        the first two steps can be skipped for all three modes can be 
+        skipped if pre-computed score model conditioning tensors are 
+        provided to initialize the inference head with via the 
+        --head_init (self.head_init) directory.
 
         Parameters
         ----------
@@ -302,71 +519,96 @@ class Boltz1(LightningModule):
             For memory/efficiency purposes.
         """
         dict_out = {}
+        input_coords = None # Coordinates for Langevin/likelihoods. 
+        atom_mask = feats["atom_pad_mask"]
+        
+        # Skip input processing and Pairformer if embeddings are given.
+        if self.head_init:
+            chains = feats["record"][0].chains
+            sequences = [chain.sequence for chain in chains]
+            (
+                s, 
+                z, 
+                s_inputs, 
+                relative_position_encoding, 
+                input_coords
+            ) = self._load_head_init(sequences, atom_mask)
 
-        # Compute input embeddings
-        with torch.set_grad_enabled(
-            self.training and self.structure_prediction_training
-        ):
-            s_inputs = self.input_embedder(feats)
+        else: # Otherwise, compute input embeddings.
+            with torch.set_grad_enabled(
+                self.training and self.structure_prediction_training
+            ):
+                s_inputs = self.input_embedder(feats)
 
-            # Initialize the sequence and pairwise embeddings
-            s_init = self.s_init(s_inputs)
-            z_init = (
-                self.z_init_1(s_inputs)[:, :, None]
-                + self.z_init_2(s_inputs)[:, None, :]
-            )
-            relative_position_encoding = self.rel_pos(feats)
-            z_init = z_init + relative_position_encoding
-            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+                # Initialize the sequence and pairwise embeddings
+                s_init = self.s_init(s_inputs)
+                z_init = (
+                    self.z_init_1(s_inputs)[:, :, None]
+                    + self.z_init_2(s_inputs)[:, None, :]
+                )
+                relative_position_encoding = self.rel_pos(feats)
+                z_init = z_init + relative_position_encoding
+                z_init = z_init + self.token_bonds(feats["token_bonds"].float())
 
-            # Perform rounds of the pairwise stack
-            s = torch.zeros_like(s_init)
-            z = torch.zeros_like(z_init)
+                # Perform rounds of the pairwise stack
+                s = torch.zeros_like(s_init)
+                z = torch.zeros_like(z_init)
 
-            # Compute pairwise mask
-            mask = feats["token_pad_mask"].float()
-            pair_mask = mask[:, :, None] * mask[:, None, :]
+                # Compute pairwise mask
+                mask = feats["token_pad_mask"].float()
+                pair_mask = mask[:, :, None] * mask[:, None, :]
 
-            for i in range(recycling_steps + 1):
-                with torch.set_grad_enabled(self.training and (i == recycling_steps)):
-                    # Fixes an issue with unused parameters in autocast
-                    if (
-                        self.training
-                        and (i == recycling_steps)
-                        and torch.is_autocast_enabled()
-                    ):
-                        torch.clear_autocast_cache()
+                for i in range(recycling_steps + 1):
+                    with torch.set_grad_enabled(self.training and (i == recycling_steps)):
+                        # Fixes an issue with unused parameters in autocast
+                        if (
+                            self.training
+                            and (i == recycling_steps)
+                            and torch.is_autocast_enabled()
+                        ):
+                            torch.clear_autocast_cache()
 
-                    # Apply recycling
-                    s = s_init + self.s_recycle(self.s_norm(s))
-                    z = z_init + self.z_recycle(self.z_norm(z))
+                        # Apply recycling
+                        s = s_init + self.s_recycle(self.s_norm(s))
+                        z = z_init + self.z_recycle(self.z_norm(z))
 
-                    # Compute pairwise stack
-                    if not self.no_msa:
-                        z = z + self.msa_module(
-                            z, s_inputs, feats, use_kernels=self.use_kernels
+                        # Compute pairwise stack
+                        if not self.no_msa:
+                            z = z + self.msa_module(
+                                z, s_inputs, feats, use_kernels=self.use_kernels
+                            )
+
+                        # Revert to uncompiled version for validation
+                        if self.is_pairformer_compiled and not self.training:
+                            pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                        else:
+                            pairformer_module = self.pairformer_module
+
+                        s, z = pairformer_module(
+                            s,
+                            z,
+                            mask=mask,
+                            pair_mask=pair_mask,
+                            use_kernels=self.use_kernels,
                         )
+                        # s: torch.tensor of shape (1, n_tokens, c_s (384))
+                        # z: torch.tensor of shape (1, n_tokens, n_tokens, c_z (128))
 
-                    # Revert to uncompiled version for validation
-                    if self.is_pairformer_compiled and not self.training:
-                        pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
-                    else:
-                        pairformer_module = self.pairformer_module
+                pdistogram = self.distogram_module(z)
+                dict_out = {"pdistogram": pdistogram}
 
-                    s, z = pairformer_module(
-                        s,
-                        z,
-                        mask=mask,
-                        pair_mask=pair_mask,
-                        use_kernels=self.use_kernels,
-                    )
-                    # s: torch.tensor of shape (1, n_tokens, c_s (384))
-                    # z: torch.tensor of shape (1, n_tokens, n_tokens, c_z (128))
+        # Saving score model conditioning args if requested.
+        if self.save_conditioning_args: 
+            conddir = (self.outdir / "condition").expanduser().resolve(strict=False)
+            conddir.mkdir(parents=True, exist_ok=True)
+            with h5py.File(conddir / "tensors.hdf5", 'w') as f:
+                f.create_dataset('s_trunk', data=s.cpu().detach().numpy())
+                f.create_dataset('z_trunk', data=z.cpu().detach().numpy())
+                f.create_dataset('s_inputs', data=s_inputs.cpu().detach().numpy())
+                f.create_dataset('rpes', data=relative_position_encoding.cpu().detach().numpy())
 
-            pdistogram = self.distogram_module(z)
-            dict_out = {"pdistogram": pdistogram}
-
-        # Compute structure module
+        # For training - compute structure module.
+        # ------------------------------------------------------------------- #
         if self.training and self.structure_prediction_training:
             dict_out.update(
                 self.structure_module(
@@ -379,9 +621,9 @@ class Boltz1(LightningModule):
                 )
             )
 
-        # Inference Langevin steps.
-        # -------------------------------------------------------------------- #
-        if self.langevin_args:
+        # Langevin.
+        # ------------------------------------------------------------------- #
+        if self.mode == 'langevin':
             dict_out.update(
                 self.structure_module.langevin(
                     s_trunk=s,
@@ -390,16 +632,17 @@ class Boltz1(LightningModule):
                     feats=feats,
                     relative_position_encoding=relative_position_encoding,
                     diffusion_sampling_steps=num_sampling_steps,
-                    atom_mask=feats["atom_pad_mask"],
+                    atom_mask=atom_mask,
                     multiplicity=diffusion_samples, # Num. samples to generate
                     max_parallel_samples=max_parallel_samples,
+                    input_coords=input_coords, 
                     langevin_args=self.langevin_args
                 )
             )
 
-        # Inference structure prediction diffusion steps. 
-        # -------------------------------------------------------------------- #
-        elif (not self.training) or self.confidence_prediction:
+        # Structure prediction (PFODE or standard diffusion). 
+        # ------------------------------------------------------------------- #
+        else:
             dict_out.update(
                 self.structure_module.sample( # boltz.model.modules.diffusion.AtomDiffusion
                     s_trunk=s, # Post-trunk token-level sequence.
@@ -408,11 +651,12 @@ class Boltz1(LightningModule):
                     feats=feats,
                     relative_position_encoding=relative_position_encoding,
                     num_sampling_steps=num_sampling_steps,
-                    atom_mask=feats["atom_pad_mask"],
+                    atom_mask=atom_mask,
                     multiplicity=diffusion_samples, # Num. samples to generate
                     max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
                     steering_args=self.steering_args,
+                    mode=self.mode
                 )
             )
 
