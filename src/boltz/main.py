@@ -525,6 +525,7 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
                 entity_id = chain.entity_id
                 msa_id = f"{target_id}_{entity_id}"
                 to_generate[msa_id] = target.sequences[entity_id]
+                chain.sequence = target.sequences[entity_id]
                 chain.msa_id = msa_dir / f"{msa_id}.csv"
 
             # We do not support msa generation for non-protein chains
@@ -798,10 +799,10 @@ def cli() -> None:
     default=5000,
 )
 @click.option(
-    "--langevin",
-    type=bool,
-    help="Whether to do Langevin sampling instead of folding. Default is False.",
-    default=False
+    "--mode",
+    type=click.Choice(["predict_diff", "predict_pfode", "langevin", "likelihood"]),
+    help="The type of inference to do.",
+    default="predict_diff",
 )
 @click.option(
     "--langevin_eps",
@@ -816,9 +817,40 @@ def cli() -> None:
     default=1.0
 )
 @click.option(
+    "--head_init", 
+    type=click.Path(exists=True),
+    help=(
+        "Path to directory containing files to initialize prediction "
+        "head with. The directory must contain tensors.hdf5 and " 
+        "feats.json files (score network conditioning tensors). "
+        "Ann input.pdb file can also be contained (optional Langevin "
+        "sampling starting structure, required likelihood calculation "
+        "structure). "
+        "If a valid directory is provided, the input prep and "
+        "Pairformer steps are skipped. The diffusion rollout is also "
+        "skipped for Langevin sampling if the pdb is also given."
+    ),
+    default=None
+)
+@click.option(
+    "--save_conditioning_args",
+    type=bool,
+    help=(
+        "Whether to save score network conditioning tensors (used by "
+        "head_init)."
+    ),
+    default=None
+)
+@click.option(
     "--diffusion_samples",
     type=int,
-    help="The number of diffusion samples to use for prediction. Default is 1.",
+    help=(
+        "The number of diffusion samples. For structure prediction, "
+        "this is the number of outputted predictions. For Langevin "
+        "sampling, if given optional head_init PDB(s), each starting "
+        "structure will have floor(diffusion_samples / num_input_pdbs) "
+        "trajectories ran."
+    ),
     default=1,
 )
 @click.option(
@@ -990,6 +1022,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     langevin_sampling_steps: int = 5000,
     langevin_eps: float = 1e-3,
     langevin_noise_scale: float = 1.0,
+    head_init: str = None,
+    save_conditioning_args: bool = False,
     diffusion_samples: int = 1,
     sampling_steps_affinity: int = 200,
     diffusion_samples_affinity: int = 3,
@@ -1013,7 +1047,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     subsample_msa: bool = True,
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
-    langevin: bool = False,
+    mode: str = 'predict_diff',
     confidence: bool = True,
     experiment_name: str = None
 ) -> None:
@@ -1232,45 +1266,96 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
-        model_module = model_cls.load_from_checkpoint(
-            checkpoint,
-            strict=False,
-            predict_args=predict_args,
-            map_location="cpu",
-            diffusion_process_args=asdict(diffusion_params),
-            ema=False,
-            use_kernels=not no_kernels,
-            pairformer_args=asdict(pairformer_args),
-            msa_args=asdict(msa_args),
-            steering_args=asdict(steering_args),
-            confidence_prediction=confidence
-        )
+        # Fairscale checkpointing off for likelihood calcs.
+        if mode == 'likelihood':
+            ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            score_model_args = ckpt['hyper_parameters']['score_model_args']
+            score_model_args['activation_checkpointing'] = False
+            model_module = model_cls.load_from_checkpoint(
+                checkpoint,
+                strict=False,
+                predict_args=predict_args,
+                map_location="cpu",
+                diffusion_process_args=asdict(diffusion_params),
+                ema=False,
+                use_kernels=not no_kernels,
+                pairformer_args=asdict(pairformer_args),
+                msa_args=asdict(msa_args),
+                steering_args=asdict(steering_args),
+                confidence_prediction=confidence,
+                score_model_args=score_model_args
+            )
+
+        else:
+            model_module = model_cls.load_from_checkpoint(
+                checkpoint,
+                strict=False,
+                predict_args=predict_args,
+                map_location="cpu",
+                diffusion_process_args=asdict(diffusion_params),
+                ema=False,
+                use_kernels=not no_kernels,
+                pairformer_args=asdict(pairformer_args),
+                msa_args=asdict(msa_args),
+                steering_args=asdict(steering_args),
+                confidence_prediction=confidence
+            )
         model_module.eval()
 
-        if langevin:
-            # Checking argument incompatibilities.
-            assert diffusion_sampling_steps > diffusion_stop, (
-                f"diffusion_sampling_steps must be larger than"
-                f" diffusion_stop, but diffusion_sampling_steps is "
-                f" {diffusion_sampling_steps} and diffusion_stop is "
-                f" {diffusion_stop}."
-            ) 
+        # Checking argument incompatibilities.
+        if mode == 'langevin':
+            if diffusion_sampling_steps < diffusion_stop:
+                raise ValueError(
+                    f"diffusion_sampling_steps must be larger than"
+                    f" diffusion_stop, but diffusion_sampling_steps is "
+                    f"{diffusion_sampling_steps} and diffusion_stop is "
+                    f" {diffusion_stop}."
+                ) 
 
             langevin_args = {
                 "diffusion_stop": diffusion_stop,
                 "langevin_sampling_steps": langevin_sampling_steps,
                 "langevin_eps": langevin_eps,
                 "langevin_noise_scale": langevin_noise_scale,
-                "outdir": out_dir / "trajectories"
+                "outdir": out_dir / "trajectories",
             }
             model_module.langevin_args = langevin_args
 
-        # Compute structure predictions
-        trainer.predict(
-            model_module,
-            datamodule=data_module,
-            return_predictions=False,
-        )
+        if mode == 'likelihood':
+            if head_init is None:
+                raise ValueError(
+                    "--head_init directory containing a tensors.hdf5 "
+                    "file and 1+ PDB files is required for likelihood "
+                    "calculation."
+                )
+
+        model_module.outdir = out_dir
+        model_module.head_init = head_init
+        model_module.save_conditioning_args = save_conditioning_args
+        model_module.mode = mode
+
+        if mode != 'likelihood':
+            trainer.predict(
+                model_module,
+                datamodule=data_module,
+                return_predictions=False,
+            )
+
+        else: # Need gradient tracking for PFODE integration.
+            predict_loader = data_module.predict_dataloader()
+
+            for feats in predict_loader:
+                feats = {
+                    k: (v.clone().detach().requires_grad_(True)
+                        if isinstance(v, torch.Tensor) and v.is_floating_point()
+                        else v)
+                    for k, v in feats.items()
+                }
+                with torch.set_grad_enabled(True):
+                    model_module.likelihood(
+                        feats,
+                        diffusion_sampling_steps
+                    )
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):
