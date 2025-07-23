@@ -37,6 +37,8 @@ from boltz.model.modules.utils import (
 )
 from boltz.model.potentials.potentials import get_potentials
 
+from torchdiffeq import odeint
+
 import h5py
 import os
 
@@ -474,7 +476,6 @@ class AtomDiffusion(Module):
 
         padded_sigma = rearrange(sigma, "b -> b 1 1")
 
-        # Should be looking closely at this.
         net_out = self.score_model(
             r_noisy=self.c_in(padded_sigma) * noised_atom_coords, # 'Dimensionless' scaling, algorithm 20 step 2.
             times=self.c_noise(sigma), # Algorithm 21 step 8.
@@ -519,10 +520,16 @@ class AtomDiffusion(Module):
         multiplicity=1,
         max_parallel_samples=None,
         langevin_args=None,
+        input_coords=None,
         **network_condition_kwargs,
     ):
-        """Low-temp Langevin sampling using conditioned score model.
+        """Low-temp Langevin sampling using conditioned score model. 
 
+        If starting coordinates (a PDB) are provided by head_init,
+        those coordinates are used as the starting point for the 
+        Langevin dynamics. Otherwise, the standard diffusion rollout is 
+        done up to a set stopping point (in langevin_args). 
+        
         Parameters
         ----------
         langevin_args : dict
@@ -541,6 +548,11 @@ class AtomDiffusion(Module):
             record_id : str
                 Name of inference record (yaml or fasta filename stem).
 
+        input_coords : dict
+            Keys are PDB filenames, values are tensors of shape 
+            (n_padded_atoms, 3)
+            Processed coordinates of the input PDB(s).
+
         Notes
         -----
         Unlike all other outputs which are written to disk by the
@@ -548,88 +560,107 @@ class AtomDiffusion(Module):
         saved on the fly to prevent having to keep large trajectory 
         tensors in memory.
         """
-        diffusion_stop = langevin_args["diffusion_stop"]
-        langevin_sampling_steps = langevin_args["langevin_sampling_steps"]
-        l_eps = langevin_args["langevin_eps"]
-        langevin_noise_scale = langevin_args["langevin_noise_scale"]
-        record_id = langevin_args["record_id"]
-        outdir = langevin_args["outdir"]
-
-        diffusion_sampling_steps = default(diffusion_sampling_steps, self.num_sampling_steps) # 200 by default.
-        atom_mask = atom_mask.repeat_interleave(multiplicity, 0) # (multiplicity, next multiple of 32)
-
-        shape = (*atom_mask.shape, 3)
-
         # get the schedule, which is returned as (sigma, num_sampling_stepsgamma) tuple, and pair up with the next sigma and gamma
         sigmas = self.sample_schedule(diffusion_sampling_steps)
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
-
-        # atom position is noise at the beginning
-        init_sigma = sigmas[0] # Highest noise level.
-        atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, padded_n_atoms, 3)
-        atom_coords_denoised = None
+        diffusion_stop = langevin_args["diffusion_stop"]
         model_cache = {} if self.use_inference_model_cache else None
 
-        # gradually denoise. sigma_tm 'lags behind' sigma_t by one.
-        for sigma_tm, sigma_t, gamma in sigmas_and_gammas[:diffusion_stop]: # Only doing diffusion_stop steps of diffusion rollout.
-            random_R, random_tr = compute_random_augmentation(
-                multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
-            )
-            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True) # Centering to origin.
-            atom_coords = (
-                torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
-            )
+        if input_coords is not None:
+            # Processing input_coords dict
+            all_coords = []
+            for _, struct_coords in input_coords.items():
+                all_coords.append(struct_coords)
+            input_coords = torch.stack(all_coords, dim=0)
 
-            sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
-
-            # Gamma upscales t_hat in earlier reverse diffusion steps and 
-            # downscales it deeper into the reverse diffusion.
-            # Algorithm 18.
-            t_hat = sigma_tm * (1 + gamma)
-            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2) # noise_scale=1.003
-            eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
-            atom_coords_noisy = atom_coords + eps # eps is xi in AF3. 
-
-            with torch.no_grad():
-                atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
-
-                sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    ceil(multiplicity / max_parallel_samples)
+            if len(input_coords) > multiplicity:
+                raise ValueError(
+                    f'The number of input PDBs ({len(input_coords)}) '
+                    f'is greater than multiplicity ({multiplicity}).'
                 )
-                for sample_ids_chunk in sample_ids_chunks:
-                    atom_coords_denoised_chunk, _ = \
-                          self.preconditioned_network_forward(
-                              atom_coords_noisy[sample_ids_chunk],
-                              t_hat,
-                              training=False,
-                              network_condition_kwargs=dict(
-                                multiplicity=sample_ids_chunk.numel(),
-                                model_cache=model_cache,
-                                **network_condition_kwargs,
-                            ),
-                        )
-                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
-
-            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat # delta in algorithm 18 step 9.
-            atom_coords_next = (
-                atom_coords_noisy
-                + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
+            replicates_per_pdb = multiplicity // len(input_coords)
+            
+            atom_coords = input_coords.repeat_interleave(
+                replicates_per_pdb, 0
             )
+            atom_mask = atom_mask.repeat_interleave(replicates_per_pdb * len(input_coords), 0) # TODO: there is no need for this or the equivalent line in the else block. The resizing is only used for shape - can be cleaner.
 
-            atom_coords = atom_coords_next
+        else: # No provided starting coordinates, need to do diffusion.
+            atom_mask = atom_mask.repeat_interleave(multiplicity, 0) # (multiplicity, next multiple of 32)
+            shape = (*atom_mask.shape, 3) # (multiplicity, pad, 3)
+            diffusion_sampling_steps = default(diffusion_sampling_steps, self.num_sampling_steps) # 200 by default.
+
+            # atom position is noise at the beginning
+            init_sigma = sigmas[0] # Highest noise level.
+            atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, padded_n_atoms, 3)
+            atom_coords_denoised = None
+
+            # gradually denoise. sigma_tm 'lags behind' sigma_t by one.
+            for sigma_tm, sigma_t, gamma in sigmas_and_gammas[:diffusion_stop]: # Only doing diffusion_stop steps of diffusion rollout.
+                random_R, random_tr = compute_random_augmentation(
+                    multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
+                )
+                atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True) # Centering to origin.
+                atom_coords = (
+                    torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
+                )
+
+                sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
+
+                # Gamma upscales t_hat in earlier reverse diffusion steps and 
+                # downscales it deeper into the reverse diffusion.
+                # Algorithm 18.
+                t_hat = sigma_tm * (1 + gamma)
+                noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2) # noise_scale=1.003
+                eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
+                atom_coords_noisy = atom_coords + eps # eps is xi in AF3. 
+
+                with torch.no_grad():
+                    atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
+
+                    sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
+                    sample_ids_chunks = sample_ids.chunk(
+                        ceil(len(atom_coords_noisy) / max_parallel_samples)
+                    )
+                    for sample_ids_chunk in sample_ids_chunks:
+                        atom_coords_denoised_chunk, _ = \
+                            self.preconditioned_network_forward(
+                                atom_coords_noisy[sample_ids_chunk],
+                                t_hat,
+                                training=False,
+                                network_condition_kwargs=dict(
+                                    multiplicity=sample_ids_chunk.numel(),
+                                    model_cache=model_cache,
+                                    **network_condition_kwargs,
+                                ),
+                            )
+                        atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+
+                denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat # delta in algorithm 18 step 9.
+                atom_coords_next = (
+                    atom_coords_noisy
+                    + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
+                )
+
+                atom_coords = atom_coords_next
 
         # atom_coords : torch.tensor of shape (multiplicity, n_padded_atoms, 3) 
         # The final, nearly-denoised coordinate set.
 
         # Langevin dynamics procedure.
         # -------------------------------------------------------------------- #
+        langevin_sampling_steps = langevin_args["langevin_sampling_steps"]
+        l_eps = langevin_args["langevin_eps"]
+        langevin_noise_scale = langevin_args["langevin_noise_scale"]
+        record_id = langevin_args["record_id"]
+        outdir = langevin_args["outdir"]
+
         atom_coords_curr = atom_coords.clone()
         atom_coords_shape = atom_coords_curr.shape
-
         atom_coords_unpadded = atom_coords[:, atom_mask[0].bool(), :]
         atom_coords_unpadded_shape = atom_coords_unpadded.shape
+        num_trajs = len(atom_coords_curr)
 
         sigma_tm, _, gamma = sigmas_and_gammas[diffusion_stop]
         sigma_tm, gamma = sigma_tm.item(), gamma.item()
@@ -646,9 +677,9 @@ class AtomDiffusion(Module):
         ):
             # Compute the score.
             atom_coords_denoised = torch.zeros_like(atom_coords_curr)
-            sample_ids = torch.arange(multiplicity).to(atom_coords_curr.device)
+            sample_ids = torch.arange(num_trajs).to(atom_coords_curr.device)
             sample_ids_chunks = sample_ids.chunk(
-                ceil(multiplicity / max_parallel_samples)
+                ceil(num_trajs / max_parallel_samples)
             )
             for sample_ids_chunk in sample_ids_chunks:
                 atom_coords_denoised_chunk, _ = \
@@ -708,7 +739,70 @@ class AtomDiffusion(Module):
                 score_dset[-1, :, :, :] = score_np
                 atom_coords_curr = atom_coords_next
                 
+        # TODO: maybe turn off saving if we use an input structure?
         return dict(sample_atom_coords=atom_coords) # Want to save initial seed structures.
+    
+    def calc_likelihoods(
+        self,
+        diffusion_sampling_steps=None,
+        input_coords=None,
+        **network_condition_kwargs,
+    ):
+        """Does exact likelihood calculation using PFODE integration. 
+        
+        Parameters
+        ----------
+        diffusion_sampling_steps : int
+
+        input_coords : dict
+            Keys are PDB filenames, values are tensors of shape 
+            (n_padded_atoms, 3)
+            Processed coordinates of the input PDB(s).
+        """
+        sigmas = self.sample_schedule(diffusion_sampling_steps)
+        
+        for pdb_name, struct in tqdm(
+            input_coords.items(),
+            desc='Computing likelihoods for all provided structures',
+            mininterval=10
+        ):
+            fevals = 0
+            struct.requires_grad_()
+
+            def ode_fn(sigma, x):
+                nonlocal fevals
+                with torch.enable_grad():
+                    denoised, _ = self.preconditioned_network_forward(
+                        x[0].unsqueeze(0),
+                        sigma.item(),
+                        training=False,
+                        network_condition_kwargs=dict(
+                            multiplicity=1,
+                            model_cache={},
+                            **network_condition_kwargs,
+                        ),
+                    )
+                    fevals += 1
+                    score = (denoised - x[0]) / (sigma ** 2)
+                    update = (score * -sigma).detach()
+                    update = update.squeeze(0)
+                    div_score = torch.autograd.grad(score.sum(), x[0], create_graph=False)[0].sum()
+                    return update, -sigma * div_score.detach() # Update, likelihood.
+                
+            x_min = struct, torch.tensor([0]).to(self.device)
+            sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
+            t = struct.new_tensor([sigma_min, sigma_max])
+            sol = odeint(
+                ode_fn, 
+                x_min, 
+                t, 
+                atol=1e-4, 
+                rtol=1e-4, 
+                method='rk4' # No rk45 :(
+            )
+            latent, delta_ll = sol[0][-1], sol[1][-1]
+            ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent.flatten()).sum()
+            print('PDB: ', pdb_name, 'LIKELIHOOD: ', ll_prior + delta_ll, 'EVALS: ', {'fevals': fevals})
     
     def sample(
         self,
@@ -718,12 +812,14 @@ class AtomDiffusion(Module):
         max_parallel_samples=None,
         train_accumulate_token_repr=False,
         steering_args=None,
+        mode='predict_diff',
         **network_condition_kwargs,
     ):
         """Conditioned diffusion rollout for Boltz structure prediction.
 
         Gets called within Boltz1's forward pass following the 
-        Pairformer stack.
+        Pairformer stack. Offers two prediction modes - standard
+        diffusion sampling or deterministic PFODE sampling.
 
         Parameters
         ----------
@@ -747,6 +843,10 @@ class AtomDiffusion(Module):
                 Pairwise relative token encodings.
 
             feats : dict
+
+        mode : str
+            Sets which sampling mode to use. Options: 'predict_diff', 
+            'predict_pfode'.
         """
         if steering_args is not None and (steering_args["fk_steering"] or steering_args["guidance_update"]):
             potentials = get_potentials()
@@ -784,211 +884,242 @@ class AtomDiffusion(Module):
         token_repr = None
         token_a = None
 
-        # gradually denoise. sigma_tm 'lags behind' sigma_t by one.
-        for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
-            random_R, random_tr = compute_random_augmentation(
-                multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
-            )
-            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True) # Centering to origin.
-            atom_coords = (
-                torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
-            )
-            # TODO: I don't think this block accomplishes anything as 
-            # atom_coords_denoised is set to 0 in the line after the
-            # torch.no_grad() line. Can this be removed?
-            # if atom_coords_denoised is not None: 
-            #     atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)
-            #     atom_coords_denoised = (
-            #         torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
-            #         + random_tr
-            #     )
-
-            if steering_args is not None and steering_args["guidance_update"] and scaled_guidance_update is not None:
-                scaled_guidance_update = torch.einsum(
-                    "bmd,bds->bms", scaled_guidance_update, random_R
+        # PFODE sampling.
+        # ------------------------------------------------------------------- #
+        if mode == 'predict_pfode':
+            fevals = 0
+            def ode_fn(sigma, x):
+                # x: torch.tensor of shape (<=multiplicity, num_padded_atoms, 3)
+                nonlocal fevals
+                denoised, _ = self.preconditioned_network_forward(
+                    x,
+                    sigma.item(),
+                    training=False,
+                    network_condition_kwargs=dict(
+                        multiplicity=len(x),
+                        model_cache={},
+                        **network_condition_kwargs,
+                    ),
                 )
-
-            sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
-
-            # Gamma upscales t_hat in earlier reverse diffusion steps and 
-            # downscales it deeper into the reverse diffusion.
-            # Algorithm 18.
-            t_hat = sigma_tm * (1 + gamma)
-            steering_t = 1.0 - (step_idx / num_sampling_steps)
-            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2) # noise_scale=1.003
-            eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
-            atom_coords_noisy = atom_coords + eps # eps is xi in AF3. 
-
-            with torch.no_grad():
-                atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
-                token_a = torch.zeros(token_repr_shape).to(atom_coords_noisy)
-
-                sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    ceil(multiplicity / max_parallel_samples)
-                )
-                for sample_ids_chunk in sample_ids_chunks:
-                    atom_coords_denoised_chunk, token_a_chunk = \
-                          self.preconditioned_network_forward(
-                              atom_coords_noisy[sample_ids_chunk],
-                              t_hat,
-                              training=False,
-                              network_condition_kwargs=dict(
-                                multiplicity=sample_ids_chunk.numel(),
-                                model_cache=model_cache,
-                                **network_condition_kwargs,
-                            ),
-                        )
-                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
-                    token_a[sample_ids_chunk] = token_a_chunk
+                fevals += 1
+                score = (denoised - x[0]) / (sigma ** 2)
+                update = (score * -sigma).detach()
+                update = update.squeeze(0)
+                return update
                 
-                # After the for loop, we have:
-                # atom_coords_denoised : torch.tensor of shape (multiplicity, n_padded_atoms, 3)
-                # token_a : torch.tensor of shape (multiplicity, n_tokens, 2 * 384)
+            sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
+            t = atom_coords.new_tensor([sigma_max, sigma_min]) # Going backwards in time.
+            sol = odeint(
+                ode_fn, 
+                atom_coords, 
+                t, 
+                atol=1e-4, 
+                rtol=1e-4, 
+                method='rk4' # No rk45 :(
+            )
+            print('EVALS: ', fevals)
+            atom_coords = sol[0][-1]
+            print('PFODE SHAPE: ', atom_coords.shape)
 
-                if steering_args is not None and steering_args["fk_steering"] and (
-                    (
-                        step_idx % steering_args["fk_resampling_interval"] == 0
-                        and noise_var > 0
+        # Standard diffusion.
+        # ------------------------------------------------------------------- #
+        # gradually denoise. sigma_tm 'lags behind' sigma_t by one.
+        else:
+            for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+                random_R, random_tr = compute_random_augmentation(
+                    multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
+                )
+                atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True) # Centering to origin.
+                atom_coords = (
+                    torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
+                )
+
+                if steering_args is not None and steering_args["guidance_update"] and scaled_guidance_update is not None:
+                    scaled_guidance_update = torch.einsum(
+                        "bmd,bds->bms", scaled_guidance_update, random_R
                     )
-                    or step_idx == num_sampling_steps - 1
-                ):
-                    # Compute energy of x_0 prediction
-                    energy = torch.zeros(multiplicity, device=self.device)
-                    for potential in potentials:
-                        parameters = potential.compute_parameters(steering_t)
-                        if parameters["resampling_weight"] > 0:
-                            component_energy = potential.compute(
-                                atom_coords_denoised,
-                                network_condition_kwargs["feats"],
-                                parameters,
+
+                sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
+
+                # Gamma upscales t_hat in earlier reverse diffusion steps and 
+                # downscales it deeper into the reverse diffusion.
+                # Algorithm 18.
+                t_hat = sigma_tm * (1 + gamma)
+                steering_t = 1.0 - (step_idx / num_sampling_steps)
+                noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2) # noise_scale=1.003
+                eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
+                atom_coords_noisy = atom_coords + eps # eps is xi in AF3. 
+
+                with torch.no_grad():
+                    atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
+                    token_a = torch.zeros(token_repr_shape).to(atom_coords_noisy)
+
+                    sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
+                    sample_ids_chunks = sample_ids.chunk(
+                        ceil(multiplicity / max_parallel_samples)
+                    )
+                    for sample_ids_chunk in sample_ids_chunks:
+                        atom_coords_denoised_chunk, token_a_chunk = \
+                            self.preconditioned_network_forward(
+                                atom_coords_noisy[sample_ids_chunk],
+                                t_hat,
+                                training=False,
+                                network_condition_kwargs=dict(
+                                    multiplicity=sample_ids_chunk.numel(),
+                                    model_cache=model_cache,
+                                    **network_condition_kwargs,
+                                ),
                             )
-                            energy += parameters["resampling_weight"] * component_energy
-                    energy_traj = torch.cat((energy_traj, energy.unsqueeze(1)), dim=1)
+                        atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+                        token_a[sample_ids_chunk] = token_a_chunk
+                    
+                    # After the for loop, we have:
+                    # atom_coords_denoised : torch.tensor of shape (multiplicity, n_padded_atoms, 3)
+                    # token_a : torch.tensor of shape (multiplicity, n_tokens, 2 * 384)
 
-                    # Compute log G values
-                    if step_idx == 0:
-                        log_G = -1 * energy
-                    else:
-                        log_G = energy_traj[:, -2] - energy_traj[:, -1]
-
-                    # Compute ll difference between guided and unguided transition distribution
-                    if steering_args["guidance_update"] and noise_var > 0:
-                        ll_difference = (
-                            eps**2 - (eps + scaled_guidance_update) ** 2
-                        ).sum(dim=(-1, -2)) / (2 * noise_var)
-                    else:
-                        ll_difference = torch.zeros_like(energy)
-
-                    # Compute resampling weights
-                    resample_weights = F.softmax(
-                        (ll_difference + steering_args["fk_lambda"] * log_G).reshape(
-                            -1, steering_args["num_particles"]
-                        ),
-                        dim=1,
-                    )
-
-                # Compute guidance update to x_0 prediction
-                if (
-                    steering_args is not None and 
-                    steering_args["guidance_update"]
-                    and step_idx < num_sampling_steps - 1
-                ):
-                    guidance_update = torch.zeros_like(atom_coords_denoised)
-                    for guidance_step in range(steering_args["num_gd_steps"]):
-                        energy_gradient = torch.zeros_like(atom_coords_denoised)
+                    if steering_args is not None and steering_args["fk_steering"] and (
+                        (
+                            step_idx % steering_args["fk_resampling_interval"] == 0
+                            and noise_var > 0
+                        )
+                        or step_idx == num_sampling_steps - 1
+                    ):
+                        # Compute energy of x_0 prediction
+                        energy = torch.zeros(multiplicity, device=self.device)
                         for potential in potentials:
                             parameters = potential.compute_parameters(steering_t)
-                            if (
-                                parameters["guidance_weight"] > 0
-                                and (guidance_step) % parameters["guidance_interval"]
-                                == 0
-                            ):
-                                energy_gradient += parameters[
-                                    "guidance_weight"
-                                ] * potential.compute_gradient(
-                                    atom_coords_denoised + guidance_update,
+                            if parameters["resampling_weight"] > 0:
+                                component_energy = potential.compute(
+                                    atom_coords_denoised,
                                     network_condition_kwargs["feats"],
                                     parameters,
                                 )
-                        guidance_update -= energy_gradient
-                    atom_coords_denoised += guidance_update
-                    scaled_guidance_update = (
-                        guidance_update
-                        * -1
-                        * self.step_scale
-                        * (sigma_t - t_hat)
-                        / t_hat
-                    )
+                                energy += parameters["resampling_weight"] * component_energy
+                        energy_traj = torch.cat((energy_traj, energy.unsqueeze(1)), dim=1)
 
-                if steering_args is not None and steering_args["fk_steering"] and (
-                    (
-                        step_idx % steering_args["fk_resampling_interval"] == 0
-                        and noise_var > 0
-                    )
-                    or step_idx == num_sampling_steps - 1
-                ):
-                    resample_indices = (
-                        torch.multinomial(
-                            resample_weights,
-                            resample_weights.shape[1]
-                            if step_idx < num_sampling_steps - 1
-                            else 1,
-                            replacement=True,
+                        # Compute log G values
+                        if step_idx == 0:
+                            log_G = -1 * energy
+                        else:
+                            log_G = energy_traj[:, -2] - energy_traj[:, -1]
+
+                        # Compute ll difference between guided and unguided transition distribution
+                        if steering_args["guidance_update"] and noise_var > 0:
+                            ll_difference = (
+                                eps**2 - (eps + scaled_guidance_update) ** 2
+                            ).sum(dim=(-1, -2)) / (2 * noise_var)
+                        else:
+                            ll_difference = torch.zeros_like(energy)
+
+                        # Compute resampling weights
+                        resample_weights = F.softmax(
+                            (ll_difference + steering_args["fk_lambda"] * log_G).reshape(
+                                -1, steering_args["num_particles"]
+                            ),
+                            dim=1,
                         )
-                        + resample_weights.shape[1]
-                        * torch.arange(
-                            resample_weights.shape[0], device=resample_weights.device
-                        ).unsqueeze(-1)
-                    ).flatten()
 
-                    atom_coords = atom_coords[resample_indices]
-                    atom_coords_noisy = atom_coords_noisy[resample_indices]
-                    atom_mask = atom_mask[resample_indices]
-                    if atom_coords_denoised is not None:
-                        atom_coords_denoised = atom_coords_denoised[resample_indices]
-                    energy_traj = energy_traj[resample_indices]
-                    if steering_args["guidance_update"]:
-                        scaled_guidance_update = scaled_guidance_update[
-                            resample_indices
-                        ]
-                    if token_repr is not None:
-                        token_repr = token_repr[resample_indices]
-                    if token_a is not None:
-                        token_a = token_a[resample_indices]
+                    # Compute guidance update to x_0 prediction
+                    if (
+                        steering_args is not None and 
+                        steering_args["guidance_update"]
+                        and step_idx < num_sampling_steps - 1
+                    ):
+                        guidance_update = torch.zeros_like(atom_coords_denoised)
+                        for guidance_step in range(steering_args["num_gd_steps"]):
+                            energy_gradient = torch.zeros_like(atom_coords_denoised)
+                            for potential in potentials:
+                                parameters = potential.compute_parameters(steering_t)
+                                if (
+                                    parameters["guidance_weight"] > 0
+                                    and (guidance_step) % parameters["guidance_interval"]
+                                    == 0
+                                ):
+                                    energy_gradient += parameters[
+                                        "guidance_weight"
+                                    ] * potential.compute_gradient(
+                                        atom_coords_denoised + guidance_update,
+                                        network_condition_kwargs["feats"],
+                                        parameters,
+                                    )
+                            guidance_update -= energy_gradient
+                        atom_coords_denoised += guidance_update
+                        scaled_guidance_update = (
+                            guidance_update
+                            * -1
+                            * self.step_scale
+                            * (sigma_t - t_hat)
+                            / t_hat
+                        )
 
-            if self.accumulate_token_repr:
-                if token_repr is None:
-                    token_repr = torch.zeros_like(token_a)
+                    if steering_args is not None and steering_args["fk_steering"] and (
+                        (
+                            step_idx % steering_args["fk_resampling_interval"] == 0
+                            and noise_var > 0
+                        )
+                        or step_idx == num_sampling_steps - 1
+                    ):
+                        resample_indices = (
+                            torch.multinomial(
+                                resample_weights,
+                                resample_weights.shape[1]
+                                if step_idx < num_sampling_steps - 1
+                                else 1,
+                                replacement=True,
+                            )
+                            + resample_weights.shape[1]
+                            * torch.arange(
+                                resample_weights.shape[0], device=resample_weights.device
+                            ).unsqueeze(-1)
+                        ).flatten()
 
-                with torch.set_grad_enabled(train_accumulate_token_repr):
-                    sigma = torch.full(
-                        (atom_coords_denoised.shape[0],),
-                        t_hat,
-                        device=atom_coords_denoised.device,
-                    )
-                    token_repr = self.out_token_feat_update(
-                        times=self.c_noise(sigma), acc_a=token_repr, next_a=token_a
-                    )
+                        atom_coords = atom_coords[resample_indices]
+                        atom_coords_noisy = atom_coords_noisy[resample_indices]
+                        atom_mask = atom_mask[resample_indices]
+                        if atom_coords_denoised is not None:
+                            atom_coords_denoised = atom_coords_denoised[resample_indices]
+                        energy_traj = energy_traj[resample_indices]
+                        if steering_args["guidance_update"]:
+                            scaled_guidance_update = scaled_guidance_update[
+                                resample_indices
+                            ]
+                        if token_repr is not None:
+                            token_repr = token_repr[resample_indices]
+                        if token_a is not None:
+                            token_a = token_a[resample_indices]
 
-            if self.alignment_reverse_diff:
-                with torch.autocast("cuda", enabled=False):
-                    atom_coords_noisy = weighted_rigid_align(
-                        atom_coords_noisy.float(),
-                        atom_coords_denoised.float(),
-                        atom_mask.float(),
-                        atom_mask.float(),
-                    )
+                if self.accumulate_token_repr:
+                    if token_repr is None:
+                        token_repr = torch.zeros_like(token_a)
 
-                atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
+                    with torch.set_grad_enabled(train_accumulate_token_repr):
+                        sigma = torch.full(
+                            (atom_coords_denoised.shape[0],),
+                            t_hat,
+                            device=atom_coords_denoised.device,
+                        )
+                        token_repr = self.out_token_feat_update(
+                            times=self.c_noise(sigma), acc_a=token_repr, next_a=token_a
+                        )
 
-            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat # delta in algorithm 18 step 9.
-            atom_coords_next = (
-                atom_coords_noisy
-                + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
-            )
+                if self.alignment_reverse_diff:
+                    with torch.autocast("cuda", enabled=False):
+                        atom_coords_noisy = weighted_rigid_align(
+                            atom_coords_noisy.float(),
+                            atom_coords_denoised.float(),
+                            atom_mask.float(),
+                            atom_mask.float(),
+                        )
 
-            atom_coords = atom_coords_next
+                    atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
+
+                denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat # delta in algorithm 18 step 9.
+                atom_coords_next = (
+                    atom_coords_noisy
+                    + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
+                )
+
+                atom_coords = atom_coords_next
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
 
