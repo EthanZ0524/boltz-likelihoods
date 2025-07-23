@@ -37,8 +37,8 @@ class BoltzWriter(BasePredictionWriter):
             msg = f"Invalid output format: {output_format}"
             raise ValueError(msg)
 
-        self.data_dir = Path(data_dir)
-        self.output_dir = Path(output_dir)
+        self.data_dir = Path(data_dir) # .../predictions/structures (see pred_writer instantiation in main.py)
+        self.output_dir = Path(output_dir) # .../predictions
         self.output_format = output_format
         self.failed = 0
         self.boltz2 = boltz2
