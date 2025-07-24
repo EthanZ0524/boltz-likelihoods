@@ -1,4 +1,5 @@
 import multiprocessing
+import shutil
 import os
 import pickle
 import platform
@@ -873,6 +874,24 @@ def cli() -> None:
     default=None,
 )
 @click.option(
+    "--atol",
+    type=float,
+    default=1e-6,
+    help=(
+        "Absolute tol value for ODEs (likelihood and sampling). "
+        "Default is 1e-6 (Scipy RK45 default)."
+    )
+)
+@click.option(
+    "--rtol",
+    type=float,
+    default=1e-3,
+    help=(
+        "Relative tol value for ODEs (likelihood and sampling). "
+        "Default is 1e-3 (Scipy RK45 default)."
+    )
+)
+@click.option(
     "--write_full_pae",
     type=bool,
     is_flag=True,
@@ -1008,6 +1027,12 @@ def cli() -> None:
     help="Experiment name for outdir naming.",
     default=None
 )
+@click.option(
+    "--slurm_path",
+    type=str,
+    help="Path of run_boltz.sh file.",
+    default=None
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1029,6 +1054,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     diffusion_samples_affinity: int = 3,
     max_parallel_samples: Optional[int] = None,
     step_scale: Optional[float] = None,
+    atol: float = 1e-6,
+    rtol: float = 1e-3,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1049,7 +1076,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     no_kernels: bool = False,
     mode: str = 'predict_diff',
     confidence: bool = True,
-    experiment_name: str = None
+    experiment_name: str = None,
+    slurm_path: str = None
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1093,6 +1121,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     else:
         out_dir = out_dir / f"boltz_results_{data.stem}"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copying slurm script for run parameter tracking.
+    shutil.copy(slurm_path, str(out_dir))
 
     # Download necessary data and model
     if model == "boltz1":
@@ -1312,14 +1343,21 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     f" {diffusion_stop}."
                 ) 
 
-            langevin_args = {
-                "diffusion_stop": diffusion_stop,
-                "langevin_sampling_steps": langevin_sampling_steps,
-                "langevin_eps": langevin_eps,
-                "langevin_noise_scale": langevin_noise_scale,
-                "outdir": out_dir / "trajectories",
-            }
-            model_module.langevin_args = langevin_args
+        langevin_args = {
+            "diffusion_stop": diffusion_stop,
+            "langevin_sampling_steps": langevin_sampling_steps,
+            "langevin_eps": langevin_eps,
+            "langevin_noise_scale": langevin_noise_scale,
+            "outdir": out_dir / "trajectories",
+        }
+            
+        model_module.langevin_args = langevin_args
+
+        ode_args = {
+            'rtol': rtol,
+            'atol': atol
+        }
+        model_module.ode_args = ode_args
 
         if mode == 'likelihood':
             if head_init is None:
