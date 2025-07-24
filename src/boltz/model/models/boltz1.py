@@ -269,8 +269,8 @@ class Boltz1(LightningModule):
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
-        # Langevin args
         self.langevin_args = None
+        self.ode_args = None
 
         self.outdir = None
         self.head_init = None
@@ -470,6 +470,9 @@ class Boltz1(LightningModule):
             raise ValueError(
                 'No input.pdb file was provided.'
             )
+        
+        likelihood_args = self.ode_args.copy()
+        likelihood_args['outdir'] = self.outdir
 
         self.structure_module.calc_likelihoods(
             s_trunk=s,
@@ -478,7 +481,8 @@ class Boltz1(LightningModule):
             feats=feats,
             relative_position_encoding=relative_position_encoding,
             diffusion_sampling_steps=num_sampling_steps,
-            input_coords=input_coords
+            input_coords=input_coords,
+            likelihood_args=likelihood_args
         )
 
     def forward(
@@ -656,6 +660,7 @@ class Boltz1(LightningModule):
                     max_parallel_samples=max_parallel_samples,
                     train_accumulate_token_repr=self.training,
                     steering_args=self.steering_args,
+                    ode_args=self.ode_args,
                     mode=self.mode
                 )
             )
@@ -1439,16 +1444,15 @@ class Boltz1(LightningModule):
 
         Simply calls Boltz-1's forward function and returns results.
         """
-        if self.langevin_args:
-            record = batch["record"][batch_idx]
-            self.langevin_args.update({"record_id": record.id})
+        record = batch["record"][batch_idx]
+        self.langevin_args.update({"record_id": record.id})
         try:
             out = self(
                 batch, # Dict of input tensors outputted by BoltzFeaturizer.
                 recycling_steps=self.predict_args["recycling_steps"],
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],
-                max_parallel_samples=self.predict_args["diffusion_samples"],
+                max_parallel_samples=self.predict_args["max_parallel_samples"],
                 run_confidence_sequentially=True,
             )
             pred_dict = {"exception": False}
