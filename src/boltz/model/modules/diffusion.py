@@ -41,6 +41,7 @@ from torchdiffeq import odeint
 
 import h5py
 import os
+import json
 
 from tqdm import tqdm
 
@@ -620,9 +621,7 @@ class AtomDiffusion(Module):
                     atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
 
                     sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
-                    sample_ids_chunks = sample_ids.chunk(
-                        ceil(len(atom_coords_noisy) / max_parallel_samples)
-                    )
+                    sample_ids_chunks = sample_ids.split(max_parallel_samples)
                     for sample_ids_chunk in sample_ids_chunks:
                         atom_coords_denoised_chunk, _ = \
                             self.preconditioned_network_forward(
@@ -678,9 +677,7 @@ class AtomDiffusion(Module):
             # Compute the score.
             atom_coords_denoised = torch.zeros_like(atom_coords_curr)
             sample_ids = torch.arange(num_trajs).to(atom_coords_curr.device)
-            sample_ids_chunks = sample_ids.chunk(
-                ceil(num_trajs / max_parallel_samples)
-            )
+            sample_ids_chunks = sample_ids.split(max_parallel_samples)
             for sample_ids_chunk in sample_ids_chunks:
                 atom_coords_denoised_chunk, _ = \
                         self.preconditioned_network_forward(
@@ -746,6 +743,7 @@ class AtomDiffusion(Module):
         self,
         diffusion_sampling_steps=None,
         input_coords=None,
+        likelihood_args=None,
         **network_condition_kwargs,
     ):
         """Does exact likelihood calculation using PFODE integration. 
@@ -760,6 +758,7 @@ class AtomDiffusion(Module):
             Processed coordinates of the input PDB(s).
         """
         sigmas = self.sample_schedule(diffusion_sampling_steps)
+        results = {}
         
         for pdb_name, struct in tqdm(
             input_coords.items(),
@@ -773,7 +772,7 @@ class AtomDiffusion(Module):
                 nonlocal fevals
                 with torch.enable_grad():
                     denoised, _ = self.preconditioned_network_forward(
-                        x[0].unsqueeze(0),
+                        x[0].unsqueeze(0), # preconditioned_network_forward anticipates a batch dimension.
                         sigma.item(),
                         training=False,
                         network_condition_kwargs=dict(
@@ -787,7 +786,7 @@ class AtomDiffusion(Module):
                     update = (score * -sigma).detach()
                     update = update.squeeze(0)
                     div_score = torch.autograd.grad(score.sum(), x[0], create_graph=False)[0].sum()
-                    return update, -sigma * div_score.detach() # Update, likelihood.
+                    return update, -sigma * div_score.detach() # (n_padded_atoms, 3), scalar.
                 
             x_min = struct, torch.tensor([0]).to(self.device)
             sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
@@ -796,13 +795,17 @@ class AtomDiffusion(Module):
                 ode_fn, 
                 x_min, 
                 t, 
-                atol=1e-4, 
-                rtol=1e-4, 
-                method='rk4' # No rk45 :(
+                atol=likelihood_args['atol'], 
+                rtol=likelihood_args['rtol'], 
+                method='dopri5' # Rk45.
             )
             latent, delta_ll = sol[0][-1], sol[1][-1]
             ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent.flatten()).sum()
-            print('PDB: ', pdb_name, 'LIKELIHOOD: ', ll_prior + delta_ll, 'EVALS: ', {'fevals': fevals})
+            results[pdb_name] = (ll_prior + delta_ll).item()
+
+        outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
+        with open(outdir / "likelihoods.json", "w") as f:
+            json.dump(results, f)
     
     def sample(
         self,
@@ -812,6 +815,7 @@ class AtomDiffusion(Module):
         max_parallel_samples=None,
         train_accumulate_token_repr=False,
         steering_args=None,
+        ode_args=None,
         mode='predict_diff',
         **network_condition_kwargs,
     ):
@@ -881,45 +885,54 @@ class AtomDiffusion(Module):
         atom_coords_denoised = None
         model_cache = {} if self.use_inference_model_cache else None
 
+        sample_ids = torch.arange(multiplicity).to(atom_coords.device)
+        sample_ids_chunks = sample_ids.split(max_parallel_samples)
+                    
         token_repr = None
         token_a = None
 
         # PFODE sampling.
         # ------------------------------------------------------------------- #
         if mode == 'predict_pfode':
-            fevals = 0
-            def ode_fn(sigma, x):
-                # x: torch.tensor of shape (<=multiplicity, num_padded_atoms, 3)
-                nonlocal fevals
-                denoised, _ = self.preconditioned_network_forward(
-                    x,
-                    sigma.item(),
-                    training=False,
-                    network_condition_kwargs=dict(
-                        multiplicity=len(x),
-                        model_cache={},
-                        **network_condition_kwargs,
-                    ),
-                )
-                fevals += 1
-                score = (denoised - x[0]) / (sigma ** 2)
-                update = (score * -sigma).detach()
-                update = update.squeeze(0)
-                return update
-                
+            atom_coords_denoised = torch.zeros_like(atom_coords)
             sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
             t = atom_coords.new_tensor([sigma_max, sigma_min]) # Going backwards in time.
-            sol = odeint(
-                ode_fn, 
-                atom_coords, 
-                t, 
-                atol=1e-4, 
-                rtol=1e-4, 
-                method='rk4' # No rk45 :(
-            )
-            print('EVALS: ', fevals)
-            atom_coords = sol[0][-1]
-            print('PFODE SHAPE: ', atom_coords.shape)
+
+            for sample_ids_chunk in tqdm(
+                sample_ids_chunks, 
+                desc='Predicting batches of structures with PFODE sampling',
+                mininterval=10
+            ):
+                fevals = 0
+                def ode_fn(sigma, x):
+                    # x: torch.tensor of shape (multiplicity, num_padded_atoms, 3)
+                    nonlocal fevals
+                    denoised, _ = self.preconditioned_network_forward(
+                        x,
+                        sigma.item(),
+                        training=False,
+                        network_condition_kwargs=dict(
+                            multiplicity=len(x),
+                            model_cache={},
+                            **network_condition_kwargs,
+                        ),
+                    )
+                    fevals += 1
+                    score = (denoised - x) / (sigma ** 2)
+                    update = (score * -sigma).detach()
+                    update = update.squeeze(0)
+                    return update
+                    
+                sol = odeint(
+                    ode_fn, 
+                    atom_coords[sample_ids_chunk], 
+                    t, 
+                    atol=ode_args['atol'], 
+                    rtol=ode_args['rtol'], 
+                    method='dopri5' # RK45.
+                )
+                print('EVALS: ', fevals)
+                atom_coords[sample_ids_chunk] = sol[-1] # (multiplicity, n_padded_atoms, 3)
 
         # Standard diffusion.
         # ------------------------------------------------------------------- #
@@ -954,11 +967,11 @@ class AtomDiffusion(Module):
                     atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
                     token_a = torch.zeros(token_repr_shape).to(atom_coords_noisy)
 
-                    sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
-                    sample_ids_chunks = sample_ids.chunk(
-                        ceil(multiplicity / max_parallel_samples)
-                    )
-                    for sample_ids_chunk in sample_ids_chunks:
+                    for sample_ids_chunk in tqdm(
+                        sample_ids_chunks, 
+                        desc='Predicting batches of structures with diffusion',
+                        mininterval=10
+                    ):
                         atom_coords_denoised_chunk, token_a_chunk = \
                             self.preconditioned_network_forward(
                                 atom_coords_noisy[sample_ids_chunk],
