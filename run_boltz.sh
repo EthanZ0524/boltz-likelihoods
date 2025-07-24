@@ -13,7 +13,7 @@ MAIN_ARGS=(
     --use_msa_server \
     --confidence False \
     --mode langevin \
-    --experiment_name chignolin_multistate
+    --experiment_name chignolin_multistate_leps1e-6
     --head_init /home/ethanz/boltz-likelihoods/conditioning/chignolin
     --slurm_path /home/ethanz/boltz-likelihoods/run_boltz.sh
 )
@@ -29,9 +29,10 @@ ODE_ARGS=(
 # --------------------------------------------------------------------------- #
 
 # Args for Langevin sampling.
+# TODO: replicates_per_traj
 LANGEVIN_ARGS=(
     --langevin_sampling_steps 250000 \
-    --langevin_eps 0.00001 \
+    --langevin_eps 0.000001 \
     --langevin_noise_scale 1.0 \
     --diffusion_stop 180
 )
