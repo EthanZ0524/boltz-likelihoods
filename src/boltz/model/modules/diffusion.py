@@ -441,7 +441,7 @@ class AtomDiffusion(Module):
         Parameters
         ----------
         noised_atom_coords : torch.tensor of shape (chunk_size, 
-        padded_n_atoms, 3)
+        n_padded_atoms, 3)
             A 'chunk' of noised atom coordinates (several samples taken)
             from the 0th (multiplicity) dimension.
 
@@ -456,8 +456,6 @@ class AtomDiffusion(Module):
                 The number of diffusion samples.
             
             model_cache : dict
-                # TODO: can we remove this? It's supplied as a parameter
-                but the function doesn't even use it
 
             Additionally contains s_trunk, z_trunk, s_inputs, feats, and  
             relative_position_encoding (see AtomDiffusion.sample() 
@@ -466,7 +464,7 @@ class AtomDiffusion(Module):
         Returns
         -------
         denoised_coords : torch.tensor of shape (chunk_size, 
-        padded_n_atoms, 3)
+        n_padded_atoms, 3)
             Model prediction of a chunk of fully denoised coordinates at
             'timestep' sigma, conditioned on network_condition_args.
         """
@@ -524,15 +522,21 @@ class AtomDiffusion(Module):
         input_coords=None,
         **network_condition_kwargs,
     ):
-        """Low-temp Langevin sampling using conditioned score model. 
+        """Langevin sampling using conditioned score model. 
 
-        If starting coordinates (a PDB) are provided by head_init,
+        If starting coordinates (PDB(s)) are provided by head_init,
         those coordinates are used as the starting point for the 
         Langevin dynamics. Otherwise, the standard diffusion rollout is 
-        done up to a set stopping point (in langevin_args). 
+        done up to a set stopping point (--diffusion_stop). 
         
         Parameters
         ----------
+        atom_mask : torch.tensor of shape (1, padded_n_atoms)
+            padded_n_atoms = ceil(n_atoms / atoms_per_window_queries)).
+
+        diffusion_sampling_steps : int 
+            Controls the noise schedule of diffusion rollout.
+
         langevin_args : dict
             langevin_sampling_steps : int
                 The number of Langevin dynamics steps to take using
@@ -548,6 +552,11 @@ class AtomDiffusion(Module):
                 The directory at which to store trajectories.
             record_id : str
                 Name of inference record (yaml or fasta filename stem).
+        
+        multiplicity : int
+            The total number of trajectories to run. Eg: if 5 starting 
+            PDBs are provided and multiplicity is 12, two trajectories
+            will be run per starting structure (10 trajectories total).
 
         input_coords : dict
             Keys are PDB filenames, values are tensors of shape 
@@ -561,7 +570,6 @@ class AtomDiffusion(Module):
         saved on the fly to prevent having to keep large trajectory 
         tensors in memory.
         """
-        # get the schedule, which is returned as (sigma, num_sampling_stepsgamma) tuple, and pair up with the next sigma and gamma
         sigmas = self.sample_schedule(diffusion_sampling_steps)
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
@@ -588,13 +596,13 @@ class AtomDiffusion(Module):
             atom_mask = atom_mask.repeat_interleave(replicates_per_pdb * len(input_coords), 0) # TODO: there is no need for this or the equivalent line in the else block. The resizing is only used for shape - can be cleaner.
 
         else: # No provided starting coordinates, need to do diffusion.
-            atom_mask = atom_mask.repeat_interleave(multiplicity, 0) # (multiplicity, next multiple of 32)
+            atom_mask = atom_mask.repeat_interleave(multiplicity, 0) # (multiplicity, n_padded_atoms)
             shape = (*atom_mask.shape, 3) # (multiplicity, pad, 3)
             diffusion_sampling_steps = default(diffusion_sampling_steps, self.num_sampling_steps) # 200 by default.
 
             # atom position is noise at the beginning
             init_sigma = sigmas[0] # Highest noise level.
-            atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, padded_n_atoms, 3)
+            atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, n_padded_atoms, 3)
             atom_coords_denoised = None
 
             # gradually denoise. sigma_tm 'lags behind' sigma_t by one.
@@ -706,7 +714,7 @@ class AtomDiffusion(Module):
                     traj_dset = f.create_dataset(
                         "traj",
                         shape=(0, *atom_coords_unpadded_shape),
-                        maxshape=(None, *atom_coords_unpadded_shape), # (None, 5, 96, 3)
+                        maxshape=(None, *atom_coords_unpadded_shape),
                         dtype='float32',
                         chunks=(1, *atom_coords_unpadded_shape)
                     )
@@ -736,8 +744,9 @@ class AtomDiffusion(Module):
                 score_dset[-1, :, :, :] = score_np
                 atom_coords_curr = atom_coords_next
                 
-        # TODO: maybe turn off saving if we use an input structure?
-        return dict(sample_atom_coords=atom_coords) # Want to save initial seed structures.
+        # Initial seed structures will be saved.
+        # If given PDB starting structures, they will be re-saved.
+        return dict(sample_atom_coords=atom_coords)
     
     def calc_likelihoods(
         self,
@@ -767,12 +776,13 @@ class AtomDiffusion(Module):
         ):
             fevals = 0
             struct.requires_grad_()
+            n_padded_atoms = len(struct)
 
             def ode_fn(sigma, x):
                 nonlocal fevals
-                with torch.enable_grad():
+                def _score_fn(x): 
                     denoised, _ = self.preconditioned_network_forward(
-                        x[0].unsqueeze(0), # preconditioned_network_forward anticipates a batch dimension.
+                        x.unsqueeze(0),  # add batch dimension
                         sigma.item(),
                         training=False,
                         network_condition_kwargs=dict(
@@ -781,12 +791,20 @@ class AtomDiffusion(Module):
                             **network_condition_kwargs,
                         ),
                     )
-                    fevals += 1
-                    score = (denoised - x[0]) / (sigma ** 2)
+                    return ((denoised - x) / (sigma ** 2)).squeeze(0) # (n_padded_atoms, 3)
+
+                with torch.enable_grad():
+                    score = _score_fn(x[0]) # (n_padded_atoms, 3)
                     update = (score * -sigma).detach()
-                    update = update.squeeze(0)
-                    div_score = torch.autograd.grad(score.sum(), x[0], create_graph=False)[0].sum()
-                    return update, -sigma * div_score.detach() # (n_padded_atoms, 3), scalar.
+
+                    fevals += 1
+                    full_jac = torch.func.jacfwd(_score_fn)(x[0]) # (N, 3, N, 3)
+                    jac_flat = full_jac.view(
+                        n_padded_atoms * 3, 
+                        n_padded_atoms * 3
+                    )
+                    div_score = torch.trace(jac_flat)
+                    return update, -sigma * div_score.detach() # (n_padded_atoms, 3), torch scalar.
                 
             x_min = struct, torch.tensor([0]).to(self.device)
             sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
@@ -881,7 +899,7 @@ class AtomDiffusion(Module):
 
         # atom position is noise at the beginning
         init_sigma = sigmas[0] # Highest noise level.
-        atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, padded_n_atoms, 3)
+        atom_coords = init_sigma * torch.randn(shape, device=self.device) # (multiplicity, n_padded_atoms, 3)
         atom_coords_denoised = None
         model_cache = {} if self.use_inference_model_cache else None
 
