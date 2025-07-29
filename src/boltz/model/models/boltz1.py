@@ -271,6 +271,7 @@ class Boltz1(LightningModule):
 
         self.langevin_args = None
         self.ode_args = None
+        self.likelihood_args = None
 
         self.outdir = None
         self.head_init = None
@@ -451,8 +452,7 @@ class Boltz1(LightningModule):
 
     def likelihood(
         self,
-        feats, 
-        num_sampling_steps,
+        feats
     ):
         """Outer wrapper of likelihood calculations. 
         """
@@ -470,9 +470,6 @@ class Boltz1(LightningModule):
             raise ValueError(
                 'No input.pdb file was provided.'
             )
-        
-        likelihood_args = self.ode_args.copy()
-        likelihood_args['outdir'] = self.outdir
 
         self.structure_module.calc_likelihoods(
             s_trunk=s,
@@ -480,9 +477,8 @@ class Boltz1(LightningModule):
             s_inputs=s_inputs, # Pre-trunk token-level sequence.
             feats=feats,
             relative_position_encoding=relative_position_encoding,
-            diffusion_sampling_steps=num_sampling_steps,
             input_coords=input_coords,
-            likelihood_args=likelihood_args
+            likelihood_args=self.likelihood_args
         )
 
     def forward(
