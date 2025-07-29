@@ -818,6 +818,12 @@ def cli() -> None:
     default=1.0
 )
 @click.option(
+    "--replicates",
+    type=int,
+    help="Number of replicates ran for each Langevin initial struct.",
+    default=1
+)
+@click.option(
     "--head_init", 
     type=click.Path(exists=True),
     help=(
@@ -846,11 +852,8 @@ def cli() -> None:
     "--diffusion_samples",
     type=int,
     help=(
-        "The number of diffusion samples. For structure prediction, "
-        "this is the number of outputted predictions. For Langevin "
-        "sampling, if given optional head_init PDB(s), each starting "
-        "structure will have floor(diffusion_samples / num_input_pdbs) "
-        "trajectories ran."
+        "The number of samples for structure prediction (diffusion "
+        "or PFODE sampling)."
     ),
     default=1,
 )
@@ -889,6 +892,25 @@ def cli() -> None:
     help=(
         "Relative tol value for ODEs (likelihood and sampling). "
         "Default is 1e-3 (Scipy RK45 default)."
+    )
+)
+@click.option(
+    "--likelihood_mode",
+    type=click.Choice(["jac", "hutchinson"]),
+    default='jac',
+    help=(
+        "Method to use for score divergence estimation in likelihood "
+        "calculations. "
+        "Default is torch Jacobian computation."
+    )
+)
+@click.option(
+    "--hutchinson_samples",
+    type=int,
+    default=1,
+    help=(
+        "The number of samples to compute for Hutchinson trace "
+        "approximation. Default is 1."
     )
 )
 @click.option(
@@ -1047,6 +1069,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     langevin_sampling_steps: int = 5000,
     langevin_eps: float = 1e-3,
     langevin_noise_scale: float = 1.0,
+    replicates: int = 1,
     head_init: str = None,
     save_conditioning_args: bool = False,
     diffusion_samples: int = 1,
@@ -1056,6 +1079,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     step_scale: Optional[float] = None,
     atol: float = 1e-6,
     rtol: float = 1e-3,
+    likelihood_mode: str = 'jac',
+    hutchinson_samples: int = 1,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1123,7 +1148,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Copying slurm script for run parameter tracking.
-    shutil.copy(slurm_path, str(out_dir))
+    shutil.copy(str(Path(slurm_path).resolve()), str(out_dir))
 
     # Download necessary data and model
     if model == "boltz1":
@@ -1349,6 +1374,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "langevin_eps": langevin_eps,
             "langevin_noise_scale": langevin_noise_scale,
             "outdir": out_dir / "trajectories",
+            "replicates": replicates
         }
             
         model_module.langevin_args = langevin_args
@@ -1366,6 +1392,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     "file and 1+ PDB files is required for likelihood "
                     "calculation."
                 )
+            
+        likelihood_args = ode_args.copy()
+        likelihood_args['outdir'] = out_dir
+        likelihood_args['likelihood_mode'] = likelihood_mode
+        likelihood_args['hutchinson_samples'] = hutchinson_samples
+        model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir
         model_module.head_init = head_init
@@ -1390,10 +1422,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     for k, v in feats.items()
                 }
                 with torch.set_grad_enabled(True):
-                    model_module.likelihood(
-                        feats,
-                        diffusion_sampling_steps
-                    )
+                    model_module.likelihood(feats)
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):
