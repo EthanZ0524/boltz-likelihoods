@@ -283,8 +283,9 @@ class Boltz1(LightningModule):
         sequences,
         atom_mask
     ):
-        """Helper function to load score conditioning tensors and 
-        process PDB coordinates.
+        """Helper function to load score conditioning tensors 
+        (Pairformer outputs) (if provided) and process PDB coordinates
+        (if provided).
 
         Parameters
         ----------
@@ -295,8 +296,11 @@ class Boltz1(LightningModule):
 
         Returns
         -------
-        s, z, s_inputs, relative_position_encodings : score network 
-        conditioning tensors.
+        tensor_dict : dict
+            Keys and values: s, z, s_inputs, relative_position_encodings 
+            (score network conditioning tensors).
+
+        pdistogram : tensor
 
         input_coords : dict
             Keys: full PDB filepaths. Values: processed coord tensors.
@@ -315,23 +319,37 @@ class Boltz1(LightningModule):
         Currently assumes single-chain inputs.
         ACE and NME detection is not robust.
         """
-        root = self.head_init
+        root = Path(self.head_init)
 
-        try:
-            with h5py.File(Path(root) / "tensors.hdf5", 'r') as f:
+        if (root / 'tensors.hdf5').exists():
+            with h5py.File(root / "tensors.hdf5", 'r') as f:
                 s = torch.from_numpy(f['s_trunk'][:]).to(self.device)
                 z = torch.from_numpy(f['z_trunk'][:]).to(self.device)
                 s_inputs = torch.from_numpy(f['s_inputs'][:]).to(self.device)
                 relative_position_encoding = torch.from_numpy(f['rpes'][:]).to(self.device)
+                pdistogram = torch.from_numpy(f['pdistogram'][:]).to(self.device)
 
-        except Exception as e:
-            print(
-                f'The following error occurred when trying to load '
-                f'head_init files: {e}.'
-            )
+            tensor_dict = {
+                's': s,
+                'z': z,
+                's_inputs': s_inputs,
+                'relative_position_encoding': relative_position_encoding
+            }
+        
+        else: 
+            tensor_dict = None
+            pdistogram = None
                     
         # Processing PDB for Langevin/likelihoods if provided.
-        pdb_files = glob.glob(os.path.join(root, "*.pdb"))
+        pdb_files = glob.glob(os.path.join(str(root), "*.pdb"))
+
+        if len(pdb_files) == 0 and tensor_dict is None:
+            print(
+                'A head_init directory was provided but does not '
+                'contain a tensors.hdf5 file or any PDB files. Was the '
+                'provided path correct?'
+            )
+
         ref_atoms = const.ref_atoms
         has_ace = False
 
@@ -428,6 +446,7 @@ class Boltz1(LightningModule):
                 )
                 continue
             pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
+            pdb_coords = pdb_coords - pdb_coords.mean(dim=0, keepdim=True) # Centering to origin.
             all_coords.append(pdb_coords)
             pdb_names.append(file)
         
@@ -440,7 +459,82 @@ class Boltz1(LightningModule):
         else:
             input_coords = None
 
-        return s, z, s_inputs, relative_position_encoding, input_coords
+        return tensor_dict, pdistogram, input_coords
+    
+    def _run_pairformer(
+        self,
+        feats,
+        recycling_steps
+    ):
+        """Helper function - runs the Pairformer module.
+        """
+        with torch.set_grad_enabled(
+            self.training and self.structure_prediction_training
+        ):
+            s_inputs = self.input_embedder(feats)
+
+            # Initialize the sequence and pairwise embeddings
+            s_init = self.s_init(s_inputs)
+            z_init = (
+                self.z_init_1(s_inputs)[:, :, None]
+                + self.z_init_2(s_inputs)[:, None, :]
+            )
+            relative_position_encoding = self.rel_pos(feats)
+            z_init = z_init + relative_position_encoding
+            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+
+            # Perform rounds of the pairwise stack
+            s = torch.zeros_like(s_init)
+            z = torch.zeros_like(z_init)
+
+            # Compute pairwise mask
+            mask = feats["token_pad_mask"].float()
+            pair_mask = mask[:, :, None] * mask[:, None, :]
+
+            for i in range(recycling_steps + 1):
+                with torch.set_grad_enabled(self.training and (i == recycling_steps)):
+                    # Fixes an issue with unused parameters in autocast
+                    if (
+                        self.training
+                        and (i == recycling_steps)
+                        and torch.is_autocast_enabled()
+                    ):
+                        torch.clear_autocast_cache()
+
+                    # Apply recycling
+                    s = s_init + self.s_recycle(self.s_norm(s))
+                    z = z_init + self.z_recycle(self.z_norm(z))
+
+                    # Compute pairwise stack
+                    if not self.no_msa:
+                        z = z + self.msa_module(
+                            z, s_inputs, feats, use_kernels=self.use_kernels
+                        )
+
+                    # Revert to uncompiled version for validation
+                    if self.is_pairformer_compiled and not self.training:
+                        pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                    else:
+                        pairformer_module = self.pairformer_module
+
+                    s, z = pairformer_module(
+                        s,
+                        z,
+                        mask=mask,
+                        pair_mask=pair_mask,
+                        use_kernels=self.use_kernels,
+                    )
+
+            pdistogram = self.distogram_module(z)
+
+            tensor_dict = {
+                's': s,
+                'z': z,
+                's_inputs': s_inputs,
+                'relative_position_encoding': relative_position_encoding
+            }
+
+        return tensor_dict, pdistogram
 
     def setup(self, stage: str) -> None:
         """Set the model for training, validation and inference."""
@@ -452,24 +546,34 @@ class Boltz1(LightningModule):
 
     def likelihood(
         self,
-        feats
+        feats,
+        recycling_steps
     ):
-        """Outer wrapper of likelihood calculations. 
+        """Outer wrapper of likelihood calculations.
+
+        Checks head_init inputs - if no Pairformer outputs are provided, 
+        runs the Pairformer + throws an error if no input coords are 
+        provided - and then runs likelihood calculations.
         """
         chains = feats["record"][0].chains
         sequences = [chain.sequence for chain in chains]
-        (
-            s, 
-            z, 
-            s_inputs, 
-            relative_position_encoding, 
-            input_coords
-        ) = self._load_head_init(sequences, feats["atom_pad_mask"])
+        tensor_dict, _, input_coords = self._load_head_init(sequences, feats["atom_pad_mask"])
 
         if input_coords is None:
             raise ValueError(
-                'No input.pdb file was provided.'
+                'No input PDB file(s) provided.'
             )
+        
+        if tensor_dict is None:
+            tensor_dict, _ = self._run_pairformer(
+                feats,
+                recycling_steps
+            )
+        
+        s = tensor_dict['s']
+        z = tensor_dict['z']
+        s_inputs = tensor_dict['s_inputs']
+        relative_position_encoding = tensor_dict['relative_position_encoding']
 
         self.structure_module.calc_likelihoods(
             s_trunk=s,
@@ -500,9 +604,9 @@ class Boltz1(LightningModule):
         The entire inference pipeline (input preparation, 
         Pairformer, and mode-specific head) can be run. Alternatively, 
         the first two steps can be skipped for all three modes can be 
-        skipped if pre-computed score model conditioning tensors are 
-        provided to initialize the inference head with via the 
-        --head_init (self.head_init) directory.
+        skipped if pre-computed Pairformer outputs are provided to 
+        initialize the inference head with via the --head_init 
+        (self.head_init) directory.
 
         Parameters
         ----------
@@ -518,84 +622,31 @@ class Boltz1(LightningModule):
         max_parallel_samples : int, default=5 (set in main.py)
             For memory/efficiency purposes.
         """
-        dict_out = {}
+        tensor_dict = None
         input_coords = None # Coordinates for Langevin/likelihoods. 
         atom_mask = feats["atom_pad_mask"]
         
-        # Skip input processing and Pairformer if embeddings are given.
         if self.head_init:
             chains = feats["record"][0].chains
             sequences = [chain.sequence for chain in chains]
-            (
-                s, 
-                z, 
-                s_inputs, 
-                relative_position_encoding, 
-                input_coords
-            ) = self._load_head_init(sequences, atom_mask)
+            tensor_dict, pdistogram, input_coords = self._load_head_init(sequences, feats["atom_pad_mask"])
 
-        else: # Otherwise, compute input embeddings.
-            with torch.set_grad_enabled(
-                self.training and self.structure_prediction_training
-            ):
-                s_inputs = self.input_embedder(feats)
+        # Run the Pairformer only if not given pre-computed Pairformer outputs.
+        if tensor_dict is None: # pdistogram will also either be None or won't be instantiated.
+            '''Either no head_init folder was given, or Pairformer 
+            tensors are not provided in head_init. Either way, we must 
+            compute them.
+            '''
+            tensor_dict, pdistogram = self._run_pairformer(
+                feats,
+                recycling_steps
+            )
 
-                # Initialize the sequence and pairwise embeddings
-                s_init = self.s_init(s_inputs)
-                z_init = (
-                    self.z_init_1(s_inputs)[:, :, None]
-                    + self.z_init_2(s_inputs)[:, None, :]
-                )
-                relative_position_encoding = self.rel_pos(feats)
-                z_init = z_init + relative_position_encoding
-                z_init = z_init + self.token_bonds(feats["token_bonds"].float())
-
-                # Perform rounds of the pairwise stack
-                s = torch.zeros_like(s_init)
-                z = torch.zeros_like(z_init)
-
-                # Compute pairwise mask
-                mask = feats["token_pad_mask"].float()
-                pair_mask = mask[:, :, None] * mask[:, None, :]
-
-                for i in range(recycling_steps + 1):
-                    with torch.set_grad_enabled(self.training and (i == recycling_steps)):
-                        # Fixes an issue with unused parameters in autocast
-                        if (
-                            self.training
-                            and (i == recycling_steps)
-                            and torch.is_autocast_enabled()
-                        ):
-                            torch.clear_autocast_cache()
-
-                        # Apply recycling
-                        s = s_init + self.s_recycle(self.s_norm(s))
-                        z = z_init + self.z_recycle(self.z_norm(z))
-
-                        # Compute pairwise stack
-                        if not self.no_msa:
-                            z = z + self.msa_module(
-                                z, s_inputs, feats, use_kernels=self.use_kernels
-                            )
-
-                        # Revert to uncompiled version for validation
-                        if self.is_pairformer_compiled and not self.training:
-                            pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
-                        else:
-                            pairformer_module = self.pairformer_module
-
-                        s, z = pairformer_module(
-                            s,
-                            z,
-                            mask=mask,
-                            pair_mask=pair_mask,
-                            use_kernels=self.use_kernels,
-                        )
-                        # s: torch.tensor of shape (1, n_tokens, c_s (384))
-                        # z: torch.tensor of shape (1, n_tokens, n_tokens, c_z (128))
-
-                pdistogram = self.distogram_module(z)
-                dict_out = {"pdistogram": pdistogram}
+        dict_out = {'pdistogram': pdistogram}
+        s = tensor_dict['s']
+        z = tensor_dict['z']
+        s_inputs = tensor_dict['s_inputs']
+        relative_position_encoding = tensor_dict['relative_position_encoding']
 
         # Saving score model conditioning args if requested.
         if self.save_conditioning_args: 
@@ -606,6 +657,7 @@ class Boltz1(LightningModule):
                 f.create_dataset('z_trunk', data=z.cpu().detach().numpy())
                 f.create_dataset('s_inputs', data=s_inputs.cpu().detach().numpy())
                 f.create_dataset('rpes', data=relative_position_encoding.cpu().detach().numpy())
+                f.create_dataset('pdistogram', data=pdistogram.cpu().detach().numpy())
 
         # For training - compute structure module.
         # ------------------------------------------------------------------- #
