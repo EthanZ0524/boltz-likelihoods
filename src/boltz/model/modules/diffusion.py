@@ -566,7 +566,7 @@ class AtomDiffusion(Module):
         input_coords : dict
             Keys are PDB filenames, values are tensors of shape 
             (n_padded_atoms, 3)
-            Processed coordinates of the input PDB(s).
+            Processed centered coordinates of the input PDB(s).
 
         \\*\\*network_condition_kwargs : dict
             See AtomDiffusion.sample() docstring.
@@ -713,6 +713,10 @@ class AtomDiffusion(Module):
                 * torch.randn(atom_coords_shape, device=self.device)
             )
             atom_coords_next = atom_coords_curr + l_eps * score + noise
+            atom_coords_next = (
+                atom_coords_next 
+                - atom_coords_next.mean(dim=1, keepdim=True)
+            )  # Centering to origin.
 
             with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "a") as f:
                 if 'traj' not in f:
@@ -811,9 +815,9 @@ class AtomDiffusion(Module):
             x_min = struct, torch.tensor([0]).to(self.device)
 
             def ode_fn(sigma, x):
-                def _score_fn(x): 
+                def _score_fn(coords): 
                     denoised, _ = self.preconditioned_network_forward(
-                        x.unsqueeze(0),  # add batch dimension
+                        coords.unsqueeze(0),  # add batch dimension
                         sigma.item(),
                         training=False,
                         network_condition_kwargs=dict(
@@ -822,16 +826,17 @@ class AtomDiffusion(Module):
                             **network_condition_kwargs,
                         ),
                     )
-                    return ((denoised - x) / (sigma ** 2)).squeeze(0) # (n_padded_atoms, 3)
+                    return ((denoised - coords) / (sigma ** 2)).squeeze(0) # (n_padded_atoms, 3)
 
                 nonlocal fevals
                 fevals += 1
 
                 with torch.enable_grad():
-                    score = _score_fn(x[0]) # (n_padded_atoms, 3)
+                    centered_struct = x[0] - x[0].mean(dim=0, keepdim=True) # Centering to origin.
+                    score = _score_fn(centered_struct) # (n_padded_atoms, 3)
                     update = (score * -sigma).detach()
                     if likelihood_args['likelihood_mode'] == 'jac':
-                        full_jac = torch.func.jacfwd(_score_fn)(x[0]) # (N, 3, N, 3)
+                        full_jac = torch.func.jacfwd(_score_fn)(centered_struct) # (N, 3, N, 3)
                         jac_flat = full_jac.view(
                             n_padded_atoms * 3, 
                             n_padded_atoms * 3
@@ -842,10 +847,10 @@ class AtomDiffusion(Module):
                     else: # Hutchinson trace estimator.
                         estimates = []
                         for _ in range(likelihood_args['hutchinson_samples']):
-                            v = torch.randint_like(x[0], high=2) * 2 - 1
+                            v = torch.randint_like(centered_struct, high=2) * 2 - 1
                             jvp = torch.autograd.grad(
                                 outputs=score,
-                                inputs=x[0],
+                                inputs=centered_struct,
                                 grad_outputs=v,
                                 retain_graph=True
                             )[0]
