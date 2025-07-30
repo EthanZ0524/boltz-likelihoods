@@ -19,8 +19,10 @@ from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
 from rdkit import Chem
 from tqdm import tqdm
+import json
 
 from boltz.data import const
+from boltz.data.misc import confidence_state_dict_keys
 from boltz.data.module.inference import BoltzInferenceDataModule
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.mol import load_canonicals
@@ -1322,11 +1324,26 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
+
+        # Getting rid of confidence-related weights to avoid lengthy 
+        # warning messages.
+        if not confidence:
+            if not (cache / "boltz1_noconfidence.ckpt").exists():
+                ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+                state_dict = ckpt["state_dict"]
+                filtered_state_dict = {
+                    k: v for k, v in state_dict.items()
+                    if k not in confidence_state_dict_keys
+                }
+                ckpt["state_dict"] = filtered_state_dict
+                torch.save(ckpt, cache / "boltz1_noconfidence.ckpt")
+            checkpoint = cache / "boltz1_noconfidence.ckpt"
+
         # Fairscale checkpointing off for likelihood calcs.
         if mode == 'likelihood':
             ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
             score_model_args = ckpt['hyper_parameters']['score_model_args']
-            score_model_args['activation_checkpointing'] = False
+            score_model_args['activation_checkpointing'] = False # Allow gradient tracking.
             model_module = model_cls.load_from_checkpoint(
                 checkpoint,
                 strict=False,
@@ -1388,11 +1405,11 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         if mode == 'likelihood':
             if head_init is None:
                 raise ValueError(
-                    "--head_init directory containing a tensors.hdf5 "
-                    "file and 1+ PDB files is required for likelihood "
+                    "--head_init directory is required for likelihood "
                     "calculation."
                 )
             
+        head_init = Path(head_init).expanduser().resolve()            
         likelihood_args = ode_args.copy()
         likelihood_args['outdir'] = out_dir
         likelihood_args['likelihood_mode'] = likelihood_mode
@@ -1400,7 +1417,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir
-        model_module.head_init = head_init
+        model_module.head_init = str(head_init)
         model_module.save_conditioning_args = save_conditioning_args
         model_module.mode = mode
 
@@ -1422,7 +1439,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     for k, v in feats.items()
                 }
                 with torch.set_grad_enabled(True):
-                    model_module.likelihood(feats)
+                    model_module.likelihood(feats, recycling_steps)
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):
