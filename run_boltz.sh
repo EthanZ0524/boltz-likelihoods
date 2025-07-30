@@ -1,55 +1,83 @@
 #!/bin/bash
 #SBATCH --gres=gpu:1
 #SBATCH --job-name=run_boltz
-#SBATCH --output=/home/ethanz/slurm/slurm-%j.out
 
-source /home/ethanz/boltz-likelihoods/.venv/bin/activate
+source .venv/bin/activate
 
-# Args applied to all types of inference.
+# Set the path to this file to save it to every run's outdir. 
+SCRIPT_PATH=run_boltz.sh
+
+# The following arguments are relevant to every run, regardless of mode.
+# --------------------------------------------------------------------------- #
+# Change the four arguments below as needed.
+YAML=path/to/yaml
+MODE=langevin
+EXP_NAME=boltz_run
+HEAD_INIT=path/to/head_init # Comment this line out if not providing head_init.
+
+
 MAIN_ARGS=(
     --model boltz1 \
-    --max_parallel_samples 250 \
-    --out_dir ./predictions/ \
+    --max_parallel_samples 5 \
+    --out_dir ./ \
     --use_msa_server \
     --confidence False \
-    --mode langevin \
-    --experiment_name chignolin_multistate_leps1e-6
-    --head_init /home/ethanz/boltz-likelihoods/conditioning/chignolin
-    --slurm_path /home/ethanz/boltz-likelihoods/run_boltz.sh
+    --output_format pdb \
+    --save_conditioning_args False \
+    --mode "$MODE" \
+    --experiment_name "$EXP_NAME" \
+    --slurm_path "$SCRIPT_PATH"
 )
+
+if [[ -n "$HEAD_INIT" ]]; then
+  MAIN_ARGS+=(--head_init "$HEAD_INIT")
+fi
+
+# The following arguments are relevant to multiple modes.
+# --------------------------------------------------------------------------- #
 
 # ODE parameters, used by both likelihood calcs and ODE deterministic sampling.
 ODE_ARGS=(
-    --atol 0.00001
+    --atol 0.000001 \
     --rtol 0.001
 )
 
-# All arguments below are mode-specific.
+# 'Structure prediction' args, used by both Langevin and structure 
+# prediction rollouts.
+# step_scale affects only diffusion sampling, whereas diffusion_samples also 
+# pertains to ODE sampling.
+PRED_ARGS=(
+    --step_scale 1.0 \
+    --diffusion_samples 1 \
+)
+
+
+# The following arguments pertain to specific inference modes.
 # A mode's arguments do not affect runs of other modes. 
 # --------------------------------------------------------------------------- #
 
-# Args for Langevin sampling.
-# TODO: replicates_per_traj
-LANGEVIN_ARGS=(
-    --langevin_sampling_steps 250000 \
-    --langevin_eps 0.000001 \
-    --langevin_noise_scale 1.0 \
-    --diffusion_stop 180
+# Args for likelihood calculation.
+LIKELIHOOD_ARGS=(
+    --likelihood_mode jac \
+    --hutchinson_samples 1
 )
 
-# Args for structure prediction.
-PRED_ARGS=(
-    --diffusion_samples 15 \
-    --step_scale 0.75 \
-    --save_conditioning_args False \
-    --output_format pdb 
+# Args for Langevin sampling.
+LANGEVIN_ARGS=(
+    --langevin_sampling_steps 5000 \
+    --langevin_eps 0.001 \
+    --langevin_noise_scale 1.0 \
+    --diffusion_stop 195 \
+    --replicates 1
 )
 
 # Main run function.
 boltz predict \
-    examples/chignolin.yaml \
+    "$YAML" \
     "${LANGEVIN_ARGS[@]}" \
+    "${ODE_ARGS[@]}" \
     "${MAIN_ARGS[@]}" \
-    "${PRED_ARGS[@]}"
+    "${PRED_ARGS[@]}" \
+    "${LIKELIHOOD_ARGS[@]}"
    
 
