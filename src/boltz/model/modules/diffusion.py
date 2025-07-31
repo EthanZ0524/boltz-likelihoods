@@ -44,6 +44,7 @@ import os
 import json
 
 from tqdm import tqdm
+import time
 
 # Boltz diffusion's score network.
 class DiffusionModule(Module):
@@ -817,13 +818,13 @@ class AtomDiffusion(Module):
         
         score_jac = torch.func.jacrev(_score_fn, argnums=0, has_aux=True) # (n_padded_atoms, 3, n_padded_atoms, 3)
 
-        print('Calculating likelihoods for input structures')
-        print(f"Device: {self.device}")
+        runtimes = []
         for pdb_name, struct in tqdm(
             input_coords.items(),
             desc='Computing likelihoods for all provided structures',
             mininterval=10
         ):
+            start_time = time.time()
             fevals = 0
             struct.requires_grad_()
             n_padded_atoms = len(struct)
@@ -879,8 +880,11 @@ class AtomDiffusion(Module):
             latent, delta_ll = sol[0][-1], sol[1][-1]
             ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent.flatten()).sum()
             results[pdb_name] = (ll_prior + delta_ll).item()
-            print(f'{pdb_name} took {fevals} fevals.')
+            endtime = time.time()
+            runtimes.append(endtime - start_time)
+            print(f'{pdb_name} took {fevals} fevals in {endtime - start_time:.2f} seconds')
 
+        print(f'Average runtime per structure: {torch.mean(torch.tensor(runtimes)):.2f} seconds')
         outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
         with open(outdir / "likelihoods.json", "w") as f:
             json.dump(results, f)
