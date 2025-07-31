@@ -1444,7 +1444,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                         feats_fixed[k] = v
                 feats = feats_fixed
                 with torch.set_grad_enabled(True):
-                    model_module.likelihood(feats, recycling_steps)
+                    model_module.likelihood(feats, recycling_steps, ode_batch_size=10)
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):
