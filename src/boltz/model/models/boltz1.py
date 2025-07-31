@@ -552,7 +552,6 @@ class Boltz1(LightningModule):
         self,
         feats,
         recycling_steps,
-        ode_batch_size=1,
     ):
         """Outer wrapper of likelihood calculations.
 
@@ -579,7 +578,6 @@ class Boltz1(LightningModule):
         z = tensor_dict['z']
         s_inputs = tensor_dict['s_inputs']
         relative_position_encoding = tensor_dict['relative_position_encoding']
-
         if ode_batch_size == 1:
             self.structure_module.calc_likelihoods(
                 s_trunk=s,
@@ -599,7 +597,6 @@ class Boltz1(LightningModule):
                 relative_position_encoding=relative_position_encoding,
                 input_coords=input_coords,
                 likelihood_args=self.likelihood_args,
-                ode_batch_size=ode_batch_size,
             )
 
     def forward(

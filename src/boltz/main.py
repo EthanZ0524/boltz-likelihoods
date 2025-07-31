@@ -916,6 +916,15 @@ def cli() -> None:
     )
 )
 @click.option(
+    "--ode_batch_size",
+    type=int,
+    default=1,
+    help=(
+        "The number of samples to compute in parallel for the ODE likelihood calculation."
+        "Default is 1."
+    )
+)
+@click.option(
     "--write_full_pae",
     type=bool,
     is_flag=True,
@@ -1083,6 +1092,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     rtol: float = 1e-3,
     likelihood_mode: str = 'jac',
     hutchinson_samples: int = 1,
+    ode_batch_size: int = 1,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1415,6 +1425,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         likelihood_args['outdir'] = out_dir
         likelihood_args['likelihood_mode'] = likelihood_mode
         likelihood_args['hutchinson_samples'] = hutchinson_samples
+        likelihood_args['ode_batch_size'] = ode_batch_size
         model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir
@@ -1444,7 +1455,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                         feats_fixed[k] = v
                 feats = feats_fixed
                 with torch.set_grad_enabled(True):
-                    model_module.likelihood(feats, recycling_steps, ode_batch_size=10)
+                    model_module.likelihood(feats, recycling_steps)
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):

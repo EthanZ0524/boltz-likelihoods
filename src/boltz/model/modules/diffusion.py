@@ -893,7 +893,6 @@ class AtomDiffusion(Module):
         self,
         input_coords=None,
         likelihood_args=None,
-        ode_batch_size=1,
         **network_condition_kwargs,
     ):
         """Does exact likelihood calculation using PFODE integration. 
@@ -1008,7 +1007,7 @@ class AtomDiffusion(Module):
         ode_fn_batch = torch.vmap(ode_fn_single, in_dims=(None, 0), out_dims=0)
 
         runtimes = []
-        
+        ode_batch_size = likelihood_args.get('ode_batch_size', 1)  
         # Process structures in batches
         for i in tqdm(
             range(0, n_structs, ode_batch_size),
