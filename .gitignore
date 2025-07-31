@@ -169,4 +169,3 @@ predictions/
 slurm*
 
 run_boltz*.sh
-run_boltz_likelihood.sh
