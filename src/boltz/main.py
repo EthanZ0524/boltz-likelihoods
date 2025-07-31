@@ -1374,7 +1374,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 confidence_prediction=confidence
             )
         model_module.eval()
-
+        model_module.to(device="cuda" if accelerator == "gpu" else "cpu")
+        
         # Checking argument incompatibilities.
         if mode == 'langevin':
             if diffusion_sampling_steps < diffusion_stop:
@@ -1409,7 +1410,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     "calculation."
                 )
             
-        head_init = Path(head_init).expanduser().resolve()            
+        head_init = Path(head_init).expanduser().resolve() if head_init else None         
         likelihood_args = ode_args.copy()
         likelihood_args['outdir'] = out_dir
         likelihood_args['likelihood_mode'] = likelihood_mode
@@ -1430,14 +1431,18 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
         else: # Need gradient tracking for PFODE integration.
             predict_loader = data_module.predict_dataloader()
+            device = "cuda" if accelerator == "gpu" else "cpu"
 
             for feats in predict_loader:
-                feats = {
-                    k: (v.clone().detach().requires_grad_(True)
-                        if isinstance(v, torch.Tensor) and v.is_floating_point()
-                        else v)
-                    for k, v in feats.items()
-                }
+                feats_fixed = dict()
+                for k,v in feats.items():
+                    if isinstance(v, torch.Tensor) and v.is_floating_point():
+                        feats_fixed[k] = v.clone().detach().requires_grad_(True).to(device)
+                    elif isinstance(v, torch.Tensor):
+                        feats_fixed[k] = v.clone().detach().to(device)
+                    else:
+                        feats_fixed[k] = v
+                feats = feats_fixed
                 with torch.set_grad_enabled(True):
                     model_module.likelihood(feats, recycling_steps)
 
@@ -1505,6 +1510,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             affinity_mw_correction=affinity_mw_correction,
         )
         model_module.eval()
+        model_module.to(device="cuda" if accelerator == "gpu" else "cpu")
 
         trainer.callbacks[0] = pred_writer
         trainer.predict(
