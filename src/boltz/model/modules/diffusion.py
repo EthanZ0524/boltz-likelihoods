@@ -852,7 +852,7 @@ class AtomDiffusion(Module):
                         return update, -sigma * div_score.detach() # (n_padded_atoms, 3), torch scalar.
                         
                     else: # Hutchinson trace estimator.
-                        score = _score_fn(centered_struct, sigma) # (n_padded_atoms, 3)
+                        score = _score_fn(centered_struct, sigma)[1] # (n_padded_atoms, 3)
                         update = (score * -sigma).detach()                        
                         estimates = []
                         for _ in range(likelihood_args['hutchinson_samples']):
