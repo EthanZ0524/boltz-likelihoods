@@ -842,6 +842,7 @@ class AtomDiffusion(Module):
 
                     if likelihood_args['likelihood_mode'] == 'jac':
                         full_jac, score = score_jac(centered_struct, sigma) # (N, 3, N, 3)
+                        update = (score * -sigma).detach()                        
                         jac_flat = full_jac.view(
                             n_padded_atoms * 3, 
                             n_padded_atoms * 3
