@@ -10,16 +10,16 @@ SCRIPT_PATH=run_boltz.sh
 # The following arguments are relevant to every run, regardless of mode.
 # --------------------------------------------------------------------------- #
 # Change the four arguments below as needed.
-YAML=path/to/yaml
-MODE=langevin
-EXP_NAME=boltz_run
-HEAD_INIT=path/to/head_init # Comment this line out if not providing head_init.
+YAML=examples/chignolin.yaml
+MODE=likelihood
+EXP_NAME=new_hutchinson_test
+HEAD_INIT=conditioning/chignolin # Comment this line out if not providing head_init.
 
 
 MAIN_ARGS=(
     --model boltz1 \
     --max_parallel_samples 5 \
-    --out_dir ./ \
+    --out_dir ./predictions/ \
     --use_msa_server \
     --confidence False \
     --output_format pdb \
@@ -58,8 +58,8 @@ PRED_ARGS=(
 
 # Args for likelihood calculation.
 LIKELIHOOD_ARGS=(
-    --likelihood_mode jac \
-    --hutchinson_samples 1
+    --likelihood_mode hutchinson \
+    --hutchinson_samples 20
 )
 
 # Args for Langevin sampling.

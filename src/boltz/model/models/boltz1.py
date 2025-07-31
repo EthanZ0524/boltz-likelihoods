@@ -356,7 +356,7 @@ class Boltz1(LightningModule):
         yaml_seq = sequences[0] # TODO: assumes that the input is single-chain.
         yaml_seq_3 = [
             const.prot_letter_to_token[res] for res in yaml_seq
-        ]
+        ] # eg. [TYR, ARG, LEU]
         mismatch_errors = {}
 
         # Doing error checks on provided PDB files.
@@ -422,7 +422,11 @@ class Boltz1(LightningModule):
                 for i in range(len(pdb.xyz[0]))
             } # Keys: eg. 'ACE1-H1'. Values: eg. [0.2, 0.3, 0.1]
 
-            start = 2 if has_ace else 1
+            # # For PDB proteins, the chain might not start on residue 1.
+            first_atom = str(list(pdb.topology.atoms)[0]) # eg. LYS1-N
+            first_res_idx = int(first_atom[3])
+
+            start = first_res_idx + 1 if has_ace else first_res_idx
             for i, res in enumerate(yaml_seq_3, start=start):
                 boltz_atom_ordering = ref_atoms[res]
                 for atom in boltz_atom_ordering:

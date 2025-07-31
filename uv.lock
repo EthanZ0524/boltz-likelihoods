@@ -197,6 +197,7 @@ dependencies = [
     { name = "numba" },
     { name = "numpy" },
     { name = "openmm" },
+    { name = "openpyxl" },
     { name = "pandas" },
     { name = "parmed" },
     { name = "pytorch-lightning" },
@@ -245,6 +246,7 @@ requires-dist = [
     { name = "numba", specifier = "==0.61.0" },
     { name = "numpy", specifier = ">=1.26,<2.0" },
     { name = "openmm", specifier = ">=8.3.0" },
+    { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "pandas", specifier = ">=2.2.2" },
     { name = "parmed", specifier = ">=4.3.0" },
     { name = "pytest", marker = "extra == 'test'" },
@@ -651,6 +653,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/95/af/2a2f83f981e969ae3ec5dc30f9b0cd1a258acabc2ff7b33eb9726e334e55/einx-0.3.0.tar.gz", hash = "sha256:17ff87c6a0f68ab358c1da489f00e95f1de106fd12ff17d0fb3e210aaa1e5f8c", size = 84758 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/90/04/4a730d74fd908daad86d6b313f235cdf8e0cf1c255b392b7174ff63ea81a/einx-0.3.0-py3-none-any.whl", hash = "sha256:367d62bab8dbb8c4937308512abb6f746cc0920990589892ba0d281356d39345", size = 102958 },
+]
+
+[[package]]
+name = "et-xmlfile"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/38/af70d7ab1ae9d4da450eeec1fa3918940a5fafb9055e934af8d6eb0c2313/et_xmlfile-2.0.0.tar.gz", hash = "sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54", size = 17234, upload-time = "2024-10-25T17:25:40.039Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl", hash = "sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa", size = 18059, upload-time = "2024-10-25T17:25:39.051Z" },
 ]
 
 [[package]]
@@ -1767,6 +1778,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d4/42/d669e279fab7c31a02b8c7cea2a1f40c0aeaf3648683466e665639f709be/openmm-8.3.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:6e75f2ddddc88fd206f57897be40657d515ed847c0d7a400d7773493f0ce7172", size = 12486383 },
     { url = "https://files.pythonhosted.org/packages/9d/c6/d51c88c8ac7544548feb2bf0c80ea995071487c1fd707462a5ddf7cf3371/openmm-8.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b35242739b3fa45cd340bc0f285a87b99cf9b98b4b262090dc71b852fb26e2b1", size = 13987507 },
     { url = "https://files.pythonhosted.org/packages/c0/0f/3a5450f7bef11a3151506f5000549a79d5d398d555353f8bba70ad93752b/openmm-8.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:557bc46e04b0db77c425c3cfd9615c4160a80d918d2ec5a617b48a18f2db83b8", size = 12817370 },
+]
+
+[[package]]
+name = "openpyxl"
+version = "3.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "et-xmlfile" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/f9/88d94a75de065ea32619465d2f77b29a0469500e99012523b91cc4141cd1/openpyxl-3.1.5.tar.gz", hash = "sha256:cf0e3cf56142039133628b5acffe8ef0c12bc902d2aadd3e0fe5878dc08d1050", size = 186464, upload-time = "2024-06-28T14:03:44.161Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/da/977ded879c29cbd04de313843e76868e6e13408a94ed6b987245dc7c8506/openpyxl-3.1.5-py2.py3-none-any.whl", hash = "sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2", size = 250910, upload-time = "2024-06-28T14:03:41.161Z" },
 ]
 
 [[package]]

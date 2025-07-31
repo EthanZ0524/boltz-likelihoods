@@ -65,6 +65,8 @@ To encourage reproducibility and facilitate comparison with other models, on top
 
 If you're interested in retraining the model, currently for Boltz-1 but soon for Boltz-2, see our [training instructions](docs/training.md).
 
+## Third-party code
+The code in the 'pdbfixer' subdirectory is copied from [pdbfixer](https://github.com/openmm/pdbfixer.git) (version 1.11). The PDBFixer._addAtomsToTopology() function was modified such that terminal OXT residues are not added to C-terminal residues.
 
 ## Contributing
 
