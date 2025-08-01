@@ -992,19 +992,23 @@ class AtomDiffusion(Module):
                 estimates = []
                 for _ in range(likelihood_args['hutchinson_samples']):
                     v = torch.randint_like(centered_struct, high=2) * 2 - 1
-                    jvp = torch.autograd.grad(
-                        outputs=score,
-                        inputs=centered_struct,
-                        grad_outputs=v,
-                        retain_graph=True
-                    )[0]
-                    div_score = (jvp * v).sum()
+                    def fn(x):
+                        score, _ = _score_fn_single(x, sigma)
+                        return score
+
+                    _, jvp_result = torch.func.jvp(fn, (centered_struct,), (v,))
+                    div_score = (jvp_result * v).sum()
                     estimates.append(div_score)
                 mean = torch.stack(estimates).mean()
                 return update, -sigma * mean.detach()
 
         # Vectorize ODE function for batch processing
-        ode_fn_batch = torch.vmap(ode_fn_single, in_dims=(None, 0), out_dims=0)
+        ode_fn_batch = torch.vmap(
+            ode_fn_single, 
+            in_dims=(None, 0), 
+            out_dims=0,
+            randomness='different'
+        )
 
         runtimes = []
         ode_batch_size = likelihood_args.get('ode_batch_size', 1)  
