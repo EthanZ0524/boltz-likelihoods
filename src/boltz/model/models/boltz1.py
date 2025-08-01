@@ -578,7 +578,7 @@ class Boltz1(LightningModule):
         z = tensor_dict['z']
         s_inputs = tensor_dict['s_inputs']
         relative_position_encoding = tensor_dict['relative_position_encoding']
-        if ode_batch_size == 1:
+        if self.likelihood_args['ode_batch_size'] == 1:
             self.structure_module.calc_likelihoods(
                 s_trunk=s,
                 z_trunk=z,
