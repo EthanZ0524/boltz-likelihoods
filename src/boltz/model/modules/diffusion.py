@@ -975,12 +975,12 @@ class AtomDiffusion(Module):
         sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
         
         def ode_fn_batch(sigma, x_and_ll, curr_batch_size):
-            """ODE function for single structure"""
+            """ODE function for batched structures as input to torchode."""
             # Remember that torchode always works in the form (batch_size, features) so we need to reshape the input/outputs
             # x_and_ll is a tensor of shape (batch_size, [n_padded_atoms * 3] + 1)
             x = x_and_ll[:,:-1]  # Extract coordinates and leave the last ll
             x = x.view(curr_batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
-            centered_struct = x - x.mean(dim=0, keepdim=True)
+            centered_struct = x - x.mean(dim=1, keepdim=True)
             
             if likelihood_args['likelihood_mode'] == 'jac':
                 div_score, score = divergence_and_score_fn_batched(sigma, centered_struct)
@@ -989,7 +989,7 @@ class AtomDiffusion(Module):
                 dll_dt =  -sigma * div_score.detach()
                 return torch.cat((update, dll_dt.unsqueeze(-1)), dim=-1)
             else: # Hutchinson trace estimator
-                assert False, "Hutchinson trace estimator is not yet implemented for batch processing."
+                # assert False, "Hutchinson trace estimator is not yet implemented for batch processing."
                 score, _ = _score_fn_single(centered_struct, sigma)[0]
                 update = (score * -sigma).detach()
                 estimates = []
