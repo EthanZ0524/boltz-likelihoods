@@ -38,6 +38,7 @@ from boltz.model.modules.utils import (
 from boltz.model.potentials.potentials import get_potentials
 
 from torchdiffeq import odeint
+import torchode as to
 
 import h5py
 import os
@@ -885,6 +886,183 @@ class AtomDiffusion(Module):
             print(f'{pdb_name} took {fevals} fevals in {endtime - start_time:.2f} seconds')
 
         print(f'Average runtime per structure: {torch.mean(torch.tensor(runtimes)):.2f} seconds')
+        outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
+        with open(outdir / "likelihoods.json", "w") as f:
+            json.dump(results, f)
+
+
+    def calc_likelihoods_parallel_to(
+        self,
+        input_coords=None,
+        likelihood_args=None,
+        **network_condition_kwargs,
+    ):
+        """Does exact likelihood calculation using PFODE integration. 
+        Parallelized using vmap and torchode
+        Parameters
+        ----------
+        input_coords : dict
+            Keys are PDB filenames, values are tensors of shape 
+            (n_padded_atoms, 3)
+            Processed coordinates of the input PDB(s).
+
+        likelihood_args : dict
+            atol : float
+                Absolute tolerance of ODE solver.
+
+            rtol : float
+                Relative tolerance of ODE solver. 
+
+            likelihood_mode : str
+                Sets which method to use for calculating the score 
+                diverence term. Options: 'jac', 'hutchinson'.
+
+            hutchinson_samples : int
+                Sets how many samples to compute and average results 
+                across for Hutchinson trace estimation.
+
+            outdir : str
+                Directory to save likelihood results to.
+
+        \\*\\*network_condition_kwargs : dict
+            See AtomDiffusion.sample() docstring.
+
+        Notes
+        -----
+        calc_likelihoods' sigma_min and sigma_max values are those of
+        the default diffusion rollout's (ie. hardcoded, see line below).
+        """
+        sigmas = self.sample_schedule(200)
+        results = {}
+
+        def _score_fn_single(coords, sigma): 
+            denoised, _ = self.preconditioned_network_forward(
+                coords.unsqueeze(0),  # add batch dimension
+                sigma.unsqueeze(0),
+                training=False,
+                network_condition_kwargs=dict(
+                    multiplicity=1,
+                    model_cache={},
+                    **network_condition_kwargs,
+                ),
+            )
+            score = ((denoised - coords) / (sigma ** 2)).squeeze(0) # (n_padded_atoms, 3), remove dummy batch dimension.
+            return score, score
+        
+        jac = torch.func.jacrev(_score_fn_single, argnums=0, has_aux=True)
+        def divergence_and_score_fn_single(t, x):
+            # Note: jac computes jacobian w.r.t. first argument of _score_fn_single (coords)
+            # so we need to call jac(x, t) not jac(t, x)
+            jacobian, score = jac(x, t)
+            # jacobian shape is (n_atoms, 3, n_atoms, 3)
+            n_atoms = x.shape[0]
+            jacobian = jacobian.view(n_atoms * 3, n_atoms * 3)
+            divergence = jacobian.trace()
+            return divergence, score
+        # vmap over batch dimension of x, but t (sigma) is shared across batch
+        divergence_and_score_fn_batched = torch.func.vmap(divergence_and_score_fn_single, in_dims=(0, 0), out_dims=(0, 0))
+
+        
+        # Prepare data for batch processing
+        pdb_names = list(input_coords.keys())
+        all_structs = torch.stack([input_coords[name] for name in pdb_names], dim=0)
+        n_structs = len(pdb_names)
+        
+        # if likelihood_args['likelihood_mode'] == 'jac':
+        #     score_jac_single = torch.func.jacrev(_score_fn_single, argnums=0, has_aux=True)
+        #     score_jac_batch = torch.vmap(score_jac_single, in_dims=(0, None), out_dims=(0, 0))
+
+        sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
+        
+        def ode_fn_batch(sigma, x_and_ll, curr_batch_size):
+            """ODE function for single structure"""
+            # Remember that torchode always works in the form (batch_size, features) so we need to reshape the input/outputs
+            # x_and_ll is a tensor of shape (batch_size, [n_padded_atoms * 3] + 1)
+            x = x_and_ll[:,:-1]  # Extract coordinates and leave the last ll
+            x = x.view(curr_batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
+            centered_struct = x - x.mean(dim=0, keepdim=True)
+            
+            if likelihood_args['likelihood_mode'] == 'jac':
+                div_score, score = divergence_and_score_fn_batched(sigma, centered_struct)
+                score = score.view(curr_batch_size, -1)  # Reshape to (batch_size, n_padded_atoms * 3)
+                update = (score * -sigma.view(curr_batch_size, 1)).detach()
+                dll_dt =  -sigma * div_score.detach()
+                return torch.cat((update, dll_dt.unsqueeze(-1)), dim=-1)
+            else: # Hutchinson trace estimator
+                assert False, "Hutchinson trace estimator is not yet implemented for batch processing."
+                score, _ = _score_fn_single(centered_struct, sigma)[0]
+                update = (score * -sigma).detach()
+                estimates = []
+                for _ in range(likelihood_args['hutchinson_samples']):
+                    v = torch.randint_like(centered_struct, high=2) * 2 - 1
+                    def fn(x):
+                        score, _ = _score_fn_single(x, sigma)
+                        return score
+
+                    _, jvp_result = torch.func.jvp(fn, (centered_struct,), (v,))
+                    div_score = (jvp_result * v).sum()
+                    estimates.append(div_score)
+                mean = torch.stack(estimates).mean()
+                return update, -sigma * mean.detach()
+
+        runtimes = []
+        ode_batch_size = likelihood_args.get('ode_batch_size', 1)  
+        # Process structures in batches
+        for i in tqdm(
+            range(0, n_structs, ode_batch_size),
+            desc='Computing likelihoods in parallel batches',
+            mininterval=10
+        ):
+            start_time = time.time()
+            end_idx = min(i + ode_batch_size, n_structs)
+            batch_structs = all_structs[i:end_idx]
+            batch_names = pdb_names[i:end_idx]
+            current_batch_size = end_idx - i
+            batch_structs = batch_structs.view(current_batch_size, -1) # (current_batch_size, n_padded_atoms * 3)
+            # Prepare initial conditions for batch
+            batch_structs.requires_grad_()
+            t = batch_structs.new_tensor([sigma_min, sigma_max])
+            t_batched = t.repeat(current_batch_size, 1)  # (current_batch_size, 2)
+            x_min_batch = torch.cat(
+                (batch_structs,
+                torch.zeros(current_batch_size, 1, device=self.device)),
+                dim=-1
+            ) # (current_batch_size, [n_padded_atoms * 3] + 1)
+        
+            
+            # Solve ODE for entire batch
+            term = to.ODETerm(ode_fn_batch, with_args=True)
+            step_method = to.Dopri5(term=term)
+            step_size_controller = to.IntegralController(atol=likelihood_args['atol'], rtol=likelihood_args['rtol'], term=term)
+            adjoint = to.AutoDiffAdjoint(step_method, step_size_controller)
+            problem = to.InitialValueProblem(y0=x_min_batch, t_eval=t_batched)
+            sol = adjoint.solve(problem, args=current_batch_size,)
+            
+            # sol.ys shape (batch, timepoints, features)
+            latents, delta_lls = sol.ys[:,-1,:-1], sol.ys[:,-1,-1]
+
+            # Compute prior log-likelihoods for batch
+            ll_priors = torch.distributions.MultivariateNormal(
+                torch.zeros_like(latents), sigma_max * torch.eye(latents.shape[-1], device=latents.device)).log_prob(
+                latents
+            )
+            
+            # Store results
+            batch_likelihoods = ll_priors.detach().cpu().numpy() + delta_lls.detach().cpu().numpy()
+            print(f"batch_likelihoods shape: {batch_likelihoods.shape}", flush=True)
+            print(f"latents shape: {latents.shape}", flush=True)
+            print(f"ll_priors shape: {ll_priors.shape} ; delta_lls shape: {delta_lls.shape}", flush=True)
+            for j, name in enumerate(batch_names):
+                results[name] = float(batch_likelihoods[j])
+            
+            endtime = time.time()
+            batch_runtime = endtime - start_time
+            runtimes.append(batch_runtime)
+            print(f'Batch {i//ode_batch_size + 1} ({current_batch_size} structures) took {batch_runtime:.2f} seconds')
+
+        print(f'Average runtime per batch: {torch.mean(torch.tensor(runtimes)):.2f} seconds')
+        print(f'Average runtime per structure: {torch.mean(torch.tensor(runtimes)) / ode_batch_size:.2f} seconds')
+        
         outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
         with open(outdir / "likelihoods.json", "w") as f:
             json.dump(results, f)

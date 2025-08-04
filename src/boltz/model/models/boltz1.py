@@ -589,7 +589,7 @@ class Boltz1(LightningModule):
                 likelihood_args=self.likelihood_args
             )
         else:
-            self.structure_module.calc_likelihoods_parallel(
+            self.structure_module.calc_likelihoods_parallel_to(
                 s_trunk=s,
                 z_trunk=z,
                 s_inputs=s_inputs, # Pre-trunk token-level sequence.
