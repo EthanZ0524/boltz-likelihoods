@@ -39,7 +39,7 @@ from boltz.model.potentials.potentials import get_potentials
 
 from torchdiffeq import odeint
 import torchode as to
-
+from einops import rearrange, repeat, reduce, einsum
 import h5py
 import os
 import json
@@ -949,6 +949,12 @@ class AtomDiffusion(Module):
             score = ((denoised - coords) / (sigma ** 2)).squeeze(0) # (n_padded_atoms, 3), remove dummy batch dimension.
             return score, score
         
+        _score_fn_batched = torch.func.vmap(
+            _score_fn_single, in_dims=(0, 0), out_dims=(0, 0), randomness="different"
+        )
+
+
+
         jac = torch.func.jacrev(_score_fn_single, argnums=0, has_aux=True)
         def divergence_and_score_fn_single(t, x):
             # Note: jac computes jacobian w.r.t. first argument of _score_fn_single (coords)
@@ -962,6 +968,16 @@ class AtomDiffusion(Module):
         # vmap over batch dimension of x, but t (sigma) is shared across batch
         divergence_and_score_fn_batched = torch.func.vmap(divergence_and_score_fn_single, in_dims=(0, 0), out_dims=(0, 0))
 
+        def _jvp_fn_single(coords, sigma, v):
+            """JVP function for computing the score."""
+            score, jvp, score = torch.func.jvp(_score_fn_single, 
+                                        (coords, sigma), 
+                                        (v, torch.zeros_like(sigma)),
+                                        has_aux=True)
+            return jvp
+        _jvp_fn_batched = torch.func.vmap(
+            _jvp_fn_single, in_dims=(0, 0, 0), out_dims=0, randomness="different"
+        )
         
         # Prepare data for batch processing
         pdb_names = list(input_coords.keys())
@@ -990,20 +1006,17 @@ class AtomDiffusion(Module):
                 return torch.cat((update, dll_dt.unsqueeze(-1)), dim=-1)
             else: # Hutchinson trace estimator
                 # assert False, "Hutchinson trace estimator is not yet implemented for batch processing."
-                score, _ = _score_fn_single(centered_struct, sigma)[0]
-                update = (score * -sigma).detach()
-                estimates = []
-                for _ in range(likelihood_args['hutchinson_samples']):
+                score, _ = _score_fn_batched(centered_struct, sigma)
+                score = score.view(curr_batch_size, -1)  # Reshape to (batch_size, n_padded_atoms * 3)
+                update = (score * -sigma.view(curr_batch_size, 1)).detach()
+                estimates = torch.zeros((curr_batch_size, likelihood_args['hutchinson_samples']), device=self.device)
+                for j in range(likelihood_args['hutchinson_samples']):
                     v = torch.randint_like(centered_struct, high=2) * 2 - 1
-                    def fn(x):
-                        score, _ = _score_fn_single(x, sigma)
-                        return score
-
-                    _, jvp_result = torch.func.jvp(fn, (centered_struct,), (v,))
-                    div_score = (jvp_result * v).sum()
-                    estimates.append(div_score)
-                mean = torch.stack(estimates).mean()
-                return update, -sigma * mean.detach()
+                    jvp_result = _jvp_fn_batched(centered_struct, sigma, v)
+                    div_score = einsum(jvp_result, v, "batch n_atoms d, batch n_atoms d -> batch",)
+                    estimates[:, j] = div_score
+                dll_dt = -sigma * estimates.mean(1).detach()
+                return torch.cat((update, dll_dt.unsqueeze(-1)), dim=-1)
 
         runtimes = []
         ode_batch_size = likelihood_args.get('ode_batch_size', 1)  
@@ -1035,6 +1048,7 @@ class AtomDiffusion(Module):
             step_method = to.Dopri5(term=term)
             step_size_controller = to.IntegralController(atol=likelihood_args['atol'], rtol=likelihood_args['rtol'], term=term)
             adjoint = to.AutoDiffAdjoint(step_method, step_size_controller)
+            # adjoint = torch.jit.script(adjoint)
             problem = to.InitialValueProblem(y0=x_min_batch, t_eval=t_batched)
             sol = adjoint.solve(problem, args=current_batch_size,)
             
