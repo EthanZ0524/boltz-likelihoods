@@ -802,6 +802,8 @@ class AtomDiffusion(Module):
         """
         sigmas = self.sample_schedule(200)
         results = {}
+        results_ll = {}
+        results_prior = {}
 
         def _score_fn(coords, sigma): 
             denoised, _ = self.preconditioned_network_forward(
@@ -881,6 +883,8 @@ class AtomDiffusion(Module):
             latent, delta_ll = sol[0][-1], sol[1][-1]
             ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent.flatten()).sum()
             results[pdb_name] = (ll_prior + delta_ll).item()
+            results_ll[pdb_name] = delta_ll.item()
+            results_prior[pdb_name] = ll_prior.item()
             endtime = time.time()
             runtimes.append(endtime - start_time)
             print(f'{pdb_name} took {fevals} fevals in {endtime - start_time:.2f} seconds')
@@ -889,7 +893,10 @@ class AtomDiffusion(Module):
         outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
         with open(outdir / "likelihoods.json", "w") as f:
             json.dump(results, f)
-
+        with open(outdir / "delta_ll.json", "w") as f:
+            json.dump(results_ll, f)
+        with open(outdir / "prior_ll.json", "w") as f:
+            json.dump(results_prior, f)
 
     def calc_likelihoods_parallel_to(
         self,
@@ -934,7 +941,8 @@ class AtomDiffusion(Module):
         """
         sigmas = self.sample_schedule(200)
         results = {}
-
+        results_ll = {}
+        results_prior = {}
         def _score_fn_single(coords, sigma): 
             denoised, _ = self.preconditioned_network_forward(
                 coords.unsqueeze(0),  # add batch dimension
@@ -965,7 +973,6 @@ class AtomDiffusion(Module):
             jacobian = jacobian.view(n_atoms * 3, n_atoms * 3)
             divergence = jacobian.trace()
             return divergence, score
-        # vmap over batch dimension of x, but t (sigma) is shared across batch
         divergence_and_score_fn_batched = torch.func.vmap(divergence_and_score_fn_single, in_dims=(0, 0), out_dims=(0, 0))
 
         def _jvp_fn_single(coords, sigma, v):
@@ -979,8 +986,8 @@ class AtomDiffusion(Module):
             _jvp_fn_single, in_dims=(0, 0, 0), out_dims=0, randomness="different"
         )
         
-        # Prepare data for batch processing
-        pdb_names = list(input_coords.keys())
+        # Prepare data for batch processing - ensure consistent ordering
+        pdb_names = sorted(list(input_coords.keys()))  # Sort to ensure consistent ordering
         all_structs = torch.stack([input_coords[name] for name in pdb_names], dim=0)
         n_structs = len(pdb_names)
         
@@ -994,28 +1001,38 @@ class AtomDiffusion(Module):
             """ODE function for batched structures as input to torchode."""
             # Remember that torchode always works in the form (batch_size, features) so we need to reshape the input/outputs
             # x_and_ll is a tensor of shape (batch_size, [n_padded_atoms * 3] + 1)
-            x = x_and_ll[:,:-1]  # Extract coordinates and leave the last ll
+            x = x_and_ll[:,:-1]  # Extract coordinates and leave the last feature (the log-likelihood)
             x = x.view(curr_batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
             centered_struct = x - x.mean(dim=1, keepdim=True)
             
+            # Ensure sigma is properly broadcasted for the batch
+            if sigma.dim() == 0:
+                sigma_batch = sigma.expand(curr_batch_size)
+            else:
+                sigma_batch = sigma
+            
             if likelihood_args['likelihood_mode'] == 'jac':
-                div_score, score = divergence_and_score_fn_batched(sigma, centered_struct)
+                div_score, score = divergence_and_score_fn_batched(sigma_batch, centered_struct)
                 score = score.view(curr_batch_size, -1)  # Reshape to (batch_size, n_padded_atoms * 3)
-                update = (score * -sigma.view(curr_batch_size, 1)).detach()
-                dll_dt =  -sigma * div_score.detach()
+                update = (score * -sigma_batch.view(curr_batch_size, 1)).detach()
+                dll_dt = -sigma_batch * div_score.detach()
                 return torch.cat((update, dll_dt.unsqueeze(-1)), dim=-1)
             else: # Hutchinson trace estimator
-                # assert False, "Hutchinson trace estimator is not yet implemented for batch processing."
-                score, _ = _score_fn_batched(centered_struct, sigma)
+                score, _ = _score_fn_batched(centered_struct, sigma_batch)
                 score = score.view(curr_batch_size, -1)  # Reshape to (batch_size, n_padded_atoms * 3)
-                update = (score * -sigma.view(curr_batch_size, 1)).detach()
+                update = (score * -sigma_batch.view(curr_batch_size, 1)).detach()
                 estimates = torch.zeros((curr_batch_size, likelihood_args['hutchinson_samples']), device=self.device)
+                # Use a fixed generator seed based on sigma to ensure reproducible results
+                # across different batch sizes
+                generator = torch.Generator(device=self.device)
+                base_seed = int(abs(sigma_batch[0].item() * 1000000)) if sigma_batch.numel() > 0 else 0
+                generator.manual_seed(base_seed)
                 for j in range(likelihood_args['hutchinson_samples']):
-                    v = torch.randint_like(centered_struct, high=2) * 2 - 1
-                    jvp_result = _jvp_fn_batched(centered_struct, sigma, v)
+                    v = torch.randint_like(centered_struct, high=2, generator=generator) * 2 - 1
+                    jvp_result = _jvp_fn_batched(centered_struct, sigma_batch, v)
                     div_score = einsum(jvp_result, v, "batch n_atoms d, batch n_atoms d -> batch",)
                     estimates[:, j] = div_score
-                dll_dt = -sigma * estimates.mean(1).detach()
+                dll_dt = -sigma_batch * estimates.mean(1).detach()
                 return torch.cat((update, dll_dt.unsqueeze(-1)), dim=-1)
 
         runtimes = []
@@ -1033,9 +1050,9 @@ class AtomDiffusion(Module):
             current_batch_size = end_idx - i
             batch_structs = batch_structs.view(current_batch_size, -1) # (current_batch_size, n_padded_atoms * 3)
             # Prepare initial conditions for batch
-            batch_structs.requires_grad_()
-            t = batch_structs.new_tensor([sigma_min, sigma_max])
-            t_batched = t.repeat(current_batch_size, 1)  # (current_batch_size, 2)
+            batch_structs = batch_structs.detach().requires_grad_(True)  # Ensure clean gradient state
+            t = batch_structs.new_tensor([sigma_min, sigma_max])  # 1D tensor with time points
+            t_batched = t.unsqueeze(0).expand(current_batch_size, -1)  # (current_batch_size, 2)
             x_min_batch = torch.cat(
                 (batch_structs,
                 torch.zeros(current_batch_size, 1, device=self.device)),
@@ -1056,19 +1073,17 @@ class AtomDiffusion(Module):
             latents, delta_lls = sol.ys[:,-1,:-1], sol.ys[:,-1,-1]
 
             # Compute prior log-likelihoods for batch
-            ll_priors = torch.distributions.MultivariateNormal(
-                torch.zeros_like(latents), sigma_max * torch.eye(latents.shape[-1], device=latents.device)).log_prob(
+            ll_priors = torch.distributions.Normal(0, sigma_max).log_prob(
                 latents
-            )
+            ).sum(dim=1)
             
             # Store results
             batch_likelihoods = ll_priors.detach().cpu().numpy() + delta_lls.detach().cpu().numpy()
-            print(f"batch_likelihoods shape: {batch_likelihoods.shape}", flush=True)
-            print(f"latents shape: {latents.shape}", flush=True)
-            print(f"ll_priors shape: {ll_priors.shape} ; delta_lls shape: {delta_lls.shape}", flush=True)
+
             for j, name in enumerate(batch_names):
                 results[name] = float(batch_likelihoods[j])
-            
+                results_ll[name] = float(delta_lls[j].detach().cpu().numpy())
+                results_prior[name] = float(ll_priors[j].detach().cpu().numpy())
             endtime = time.time()
             batch_runtime = endtime - start_time
             runtimes.append(batch_runtime)
@@ -1080,6 +1095,21 @@ class AtomDiffusion(Module):
         outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
         with open(outdir / "likelihoods.json", "w") as f:
             json.dump(results, f)
+        with open(outdir / "prior_ll.json", "w") as f:
+            json.dump(results_prior, f)
+        with open(outdir / "delta_ll.json", "w") as f:
+            json.dump(results_ll, f)
+
+        # save the positions of the trajectories at the start and end times
+        with h5py.File(outdir / "likelihoods.hdf5", "w") as f:
+            f.create_dataset(
+                "start_positions", 
+                data=sol.ys[:, 0, :-1].detach().cpu().numpy(),
+            )
+            f.create_dataset(
+                "end_positions",
+                data=sol.ys[:, -1, :-1].detach().cpu().numpy(),
+            )
 
     def calc_likelihoods_parallel(
         self,
