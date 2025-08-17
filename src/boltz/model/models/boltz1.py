@@ -303,7 +303,8 @@ class Boltz1(LightningModule):
         pdistogram : tensor
 
         input_coords : dict
-            Keys: full PDB filepaths. Values: processed coord tensors.
+            Keys: full PDB filepaths. Values: processed coord tensors
+            (in angstroms).
 
         Notes
         -----
@@ -451,7 +452,7 @@ class Boltz1(LightningModule):
                 continue
             pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
             pdb_coords = pdb_coords - pdb_coords.mean(dim=0, keepdim=True) # Centering to origin.
-            all_coords.append(pdb_coords)
+            all_coords.append(pdb_coords * 10) # Converting to angstroms.
             pdb_names.append(file)
         
         if len(all_coords) > 0:
