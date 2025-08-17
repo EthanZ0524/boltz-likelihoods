@@ -568,7 +568,8 @@ class AtomDiffusion(Module):
         input_coords : dict
             Keys are PDB filenames, values are tensors of shape 
             (n_padded_atoms, 3)
-            Processed centered coordinates of the input PDB(s).
+            Processed centered coordinates of the input PDB(s) in 
+            angstroms.
 
         \\*\\*network_condition_kwargs : dict
             See AtomDiffusion.sample() docstring.
@@ -1028,7 +1029,14 @@ class AtomDiffusion(Module):
                 base_seed = int(abs(sigma_batch[0].item() * 1000000)) if sigma_batch.numel() > 0 else 0
                 generator.manual_seed(base_seed)
                 for j in range(likelihood_args['hutchinson_samples']):
-                    v = torch.randint_like(centered_struct, high=2, generator=generator) * 2 - 1
+                    v = torch.randint(
+                        low=0,
+                        high=2,
+                        size=centered_struct.shape,
+                        generator=generator,
+                        device=centered_struct.device,
+                        dtype=centered_struct.dtype
+                    ) * 2 - 1
                     jvp_result = _jvp_fn_batched(centered_struct, sigma_batch, v)
                     div_score = einsum(jvp_result, v, "batch n_atoms d, batch n_atoms d -> batch",)
                     estimates[:, j] = div_score
