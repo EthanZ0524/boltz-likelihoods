@@ -893,11 +893,11 @@ class AtomDiffusion(Module):
         print(f'Average runtime per structure: {torch.mean(torch.tensor(runtimes)):.2f} seconds')
         outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
         with open(outdir / "likelihoods.json", "w") as f:
-            json.dump(results, f)
+            json.dump(results, f, indent=2)
         with open(outdir / "delta_ll.json", "w") as f:
-            json.dump(results_ll, f)
+            json.dump(results_ll, f, indent=2)
         with open(outdir / "prior_ll.json", "w") as f:
-            json.dump(results_prior, f)
+            json.dump(results_prior, f, indent=2)
 
     def calc_likelihoods_parallel_to(
         self,
@@ -1102,11 +1102,11 @@ class AtomDiffusion(Module):
         
         outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
         with open(outdir / "likelihoods.json", "w") as f:
-            json.dump(results, f)
+            json.dump(results, f, indent=2)
         with open(outdir / "prior_ll.json", "w") as f:
-            json.dump(results_prior, f)
+            json.dump(results_prior, f, indent=2)
         with open(outdir / "delta_ll.json", "w") as f:
-            json.dump(results_ll, f)
+            json.dump(results_ll, f, indent=2)
 
         # save the positions of the trajectories at the start and end times
         with h5py.File(outdir / "likelihoods.hdf5", "w") as f:
@@ -1294,7 +1294,7 @@ class AtomDiffusion(Module):
         
         outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
         with open(outdir / "likelihoods.json", "w") as f:
-            json.dump(results, f)
+            json.dump(results, f, indent=2)
       
     def sample(
         self,
