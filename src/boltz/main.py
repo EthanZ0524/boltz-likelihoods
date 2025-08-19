@@ -925,6 +925,11 @@ def cli() -> None:
     )
 )
 @click.option(
+    "--ips_likelihood",
+    is_flag=True,
+    help="Whether to use the Importance Sampling (IS) likelihood estimation."
+)
+@click.option(
     "--write_full_pae",
     type=bool,
     is_flag=True,
@@ -1093,6 +1098,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     likelihood_mode: str = 'jac',
     hutchinson_samples: int = 1,
     ode_batch_size: int = 1,
+    ips_likelihood: bool = False,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1426,6 +1432,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         likelihood_args['likelihood_mode'] = likelihood_mode
         likelihood_args['hutchinson_samples'] = hutchinson_samples
         likelihood_args['ode_batch_size'] = ode_batch_size
+        likelihood_args['ips_likelihood'] = ips_likelihood
         model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir
