@@ -922,6 +922,11 @@ def cli() -> None:
     )
 )
 @click.option(
+    "--ips_likelihood",
+    is_flag=True,
+    help="Whether to use the Importance Sampling (IS) likelihood estimation."
+)
+@click.option(
     "--umbrella_steps",
     type=int,
     default=100000,
@@ -1114,6 +1119,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     likelihood_mode: str = 'jac',
     hutchinson_samples: int = 1,
     ode_batch_size: int = 1,
+    ips_likelihood: bool = False,
     umbrella_steps: int = 100000,
     umbrella_json: str = None,
     umbrella_functor: str = None,
@@ -1460,6 +1466,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         likelihood_args['likelihood_mode'] = likelihood_mode
         likelihood_args['hutchinson_samples'] = hutchinson_samples
         likelihood_args['ode_batch_size'] = ode_batch_size
+        likelihood_args['ips_likelihood'] = ips_likelihood
         model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir

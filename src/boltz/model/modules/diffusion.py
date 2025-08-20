@@ -808,7 +808,8 @@ class AtomDiffusion(Module):
         calc_likelihoods' sigma_min and sigma_max values are those of
         the default diffusion rollout's (ie. hardcoded, see line below).
         """
-        sigmas = self.sample_schedule(200)
+        num_sampling_steps = self.num_sampling_steps # 200 by default.
+        sigmas = self.sample_schedule(num_sampling_steps)
         results = {}
         results_ll = {}
         results_prior = {}
@@ -947,7 +948,9 @@ class AtomDiffusion(Module):
         calc_likelihoods' sigma_min and sigma_max values are those of
         the default diffusion rollout's (ie. hardcoded, see line below).
         """
-        sigmas = self.sample_schedule(200)
+        num_sampling_steps = self.num_sampling_steps # 200 by default.
+
+        sigmas = self.sample_schedule(num_sampling_steps)
         results = {}
         results_ll = {}
         results_prior = {}
@@ -1167,7 +1170,9 @@ class AtomDiffusion(Module):
         calc_likelihoods' sigma_min and sigma_max values are those of
         the default diffusion rollout's (ie. hardcoded, see line below).
         """
-        sigmas = self.sample_schedule(200)
+        num_sampling_steps = self.num_sampling_steps # 200 by default.
+
+        sigmas = self.sample_schedule(num_sampling_steps)
         results = {}
 
         def _score_fn_single(coords, sigma): 
@@ -1434,6 +1439,208 @@ class AtomDiffusion(Module):
                 umbrella_force.updateParametersInContext(context)
 
                 integrator.step(1)
+    def calc_likelihoods_ips(
+        self,
+        input_coords=None,
+        likelihood_args=None,
+        **network_condition_kwargs,
+    ):
+        """Does mcmc likelihood calculation using Importance Path Sampling
+        
+        Parameters
+        ----------
+        input_coords : dict
+            Keys are PDB filenames, values are tensors of shape 
+            (n_padded_atoms, 3)
+            Processed coordinates of the input PDB(s).
+
+        likelihood_args : dict
+            atol : float
+                Absolute tolerance of ODE solver.
+
+            rtol : float
+                Relative tolerance of ODE solver. 
+
+            likelihood_mode : str
+                Sets which method to use for calculating the score 
+                diverence term. Options: 'jac', 'hutchinson'.
+
+            hutchinson_samples : int
+                Sets how many samples to compute and average results 
+                across for Hutchinson trace estimation.
+
+            outdir : str
+                Directory to save likelihood results to.
+
+        \\*\\*network_condition_kwargs : dict
+            See AtomDiffusion.sample() docstring.
+
+        Notes
+        -----
+        calc_likelihoods' sigma_min and sigma_max values are those of
+        the default diffusion rollout's (ie. hardcoded, see line below).
+        """
+        num_sampling_steps = self.num_sampling_steps # 200 by default.
+        num_mc_samples = likelihood_args.get('num_mc_samples', 1000)
+        sigmas = self.sample_schedule(num_sampling_steps) # goes from T_max to 0.
+        results = {}
+
+        def _score_fn_batch_reshaped(coords, sigma): 
+            # takes in the coords of shape (batch, n_padded_atoms * 3),
+            # reshapes it to (batch, n_padded_atoms, 3) and computes the score.
+            # and then returns the score in shape (batch, n_padded_atoms * 3)
+            batch_size, data_dim = coords.shape
+            coords = coords.view(batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
+            # center the coordinates to origin
+            coords = coords - coords.mean(dim=1, keepdim=True)
+            denoised, _ = self.preconditioned_network_forward(
+                coords,  # add batch dimension
+                sigma.item(),
+                training=False,
+                network_condition_kwargs=dict(
+                    multiplicity=1,
+                    model_cache={},
+                    **network_condition_kwargs,
+                ),
+            )
+            score = ((denoised - coords) / (sigma ** 2)) # (batch_size, n_padded_atoms, 3)
+            score = score.view(batch_size, -1)  # Reshape back to (batch_size, n_padded_atoms * 3)
+            return score
+        
+        def forward_path_em(starting_coords, timepoints):
+            """
+            Evolve the sample in forward time using the Euler-Maruyama discretization.
+            Also collects the path weights for importance sampling.
+
+            Parameters
+            ----------
+            starting_coords : torch.tensor of shape (batch, n_padded_atoms * 3)
+                Initial coordinates of the structure.
+
+            timepoints : list of floats
+                List of noise levels/time values at each time step.
+                MUST be in ascending order.
+
+            Returns
+            -------
+            coords_path : torch.tensor of shape (len(timepoints), batch, n_padded_atoms * 3)
+                Path of coordinates at each time step.
+            log_path_weights : torch.tensor of shape (batch,)
+                Logarithm of the path weights for importance sampling.
+            """
+            batch_size, data_dim = starting_coords.shape # should be n_padded_atoms * 3
+            coords_path = starting_coords.new_zeros(
+                (len(timepoints), batch_size, data_dim)
+            )
+            coords_path[0] = starting_coords
+            log_path_weights = starting_coords.new_zeros((batch_size), dtype=torch.float32)
+            for i in range(len(timepoints) - 1):
+                coords = coords_path[i]
+                sigma = timepoints[i]
+                next_sigma = timepoints[i + 1]
+                delta_t = next_sigma - sigma
+                dW = torch.randn_like(coords_path[0]) * torch.sqrt(delta_t)
+                # Karras uses f = 0, g(t) = sqrt(2t) 
+                # noising kernel is then dX_t = sqrt(2t) * dW_t so X_{t+dt} ~ N(X_t, 2t * dt I)
+
+                new_coords = coords + (2 * sigma).sqrt() * dW
+                coords_path[i + 1] = new_coords
+                log_path_weights -= (1 / (4 * delta_t * sigma)) * torch.norm(coords - new_coords, dim=-1)**2  # quadratic term
+            return coords_path, log_path_weights
+        
+        def log_path_measure_reverse_time(forward_trajectory, timesteps, score_model):
+            """
+            Calculate path measure under reverse-time dynamics
+            
+            Parameters
+            ----------
+            forward_trajectory : torch.tensor of shape (num_timesteps, batch, n_padded_atoms * 3)
+                Trajectory in forward time.
+            
+            timesteps : list of floats
+
+            both should be in ascending order of time/sigma values
+
+            score_model : callable (torch.tensor, float) -> torch.tensor
+                Function that computes the score(x,t) at given coordinates and time.
+
+            Returns
+            -------
+            log_p : torch.tensor of shape (batch,)
+                Logarithm of the path measure under reverse-time dynamics.
+            """
+            log_p = torch.zeros(forward_trajectory.shape[-1], dtype=torch.float32)
+            
+            # Iterate backwards through the forward trajectory
+            for i in range(len(timesteps) - 1):
+                t = timesteps[-(i+1)]  # Current time (going backwards)
+                delta_t = timesteps[-(i+1)] - timesteps[-(i+2)]  # Keep positive dt
+
+                # States: current (later in forward time) and next (earlier in forward time)
+                curr_x = forward_trajectory[-(i+1), :, :]
+                next_x = forward_trajectory[-(i+2), :, :] if i < len(timesteps) - 2 else forward_trajectory[0, :, :]
+                
+                # Reverse-time drift: f - g²s
+                score = score_model(curr_x, t)
+                diffusion_sq = 2 * t
+                reverse_drift = - (diffusion_sq * score)
+                
+                # Expected displacement under reverse dynamics (going backwards in time)
+                expected_displacement = -reverse_drift * delta_t  # Negative because we're going backwards
+                
+                # Actual displacement (from later to earlier state)
+                actual_displacement = next_x - curr_x
+                
+                # Onsager-Machlup formula
+                log_p -= (1 / (2 * delta_t * diffusion_sq)) * torch.norm(actual_displacement - expected_displacement, dim=-1)**2
+                
+            return log_p
+
+        runtimes = []
+        for pdb_name, struct in tqdm(
+            input_coords.items(),
+            desc='Computing likelihoods for all provided structures',
+            mininterval=10
+        ):
+            start_time = time.time()
+            struct.requires_grad_()
+            n_padded_atoms = len(struct)
+            
+            sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
+            t = struct.new_tensor([sigma_min, sigma_max])
+            x_min = struct.view(1, -1)  # Reshape to (1, n_padded_atoms * 3)
+            x_min = x_min.repeat(num_mc_samples, 1)  # Repeat for number of MC samples
+
+            ascending_time = sigmas.clone()[::-1]  # Reverse order for forward path (ascending time)
+
+            x_path, log_path_weights_fwd = forward_path_em(
+                x_min,
+                ascending_time
+            )
+
+            log_path_weights_rev = log_path_measure_reverse_time(
+                x_path,
+                ascending_time,
+                _score_fn_batch_reshaped
+            )
+
+            latent = x_path[-1]  # Last step in the forward path
+
+            ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent.flatten()).sum()
+
+            # take the average in non-log space
+            log_likelihoods = log_path_weights_fwd + log_path_weights_rev + ll_prior.item()
+            log_mean_likelihood = torch.logsumexp(log_likelihoods, dim=0) - torch.log(torch.tensor(num_mc_samples, dtype=torch.float32, device=self.device))
+
+            results[pdb_name] = log_mean_likelihood.item()
+            endtime = time.time()
+            runtimes.append(endtime - start_time)
+            print(f'{pdb_name} took  {endtime - start_time:.2f} seconds')
+
+        print(f'Average runtime per structure: {torch.mean(torch.tensor(runtimes)):.2f} seconds')
+        outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
+        with open(outdir / "likelihoods.json", "w") as f:
+            json.dump(results, f, indent=2)
 
     def sample(
         self,
