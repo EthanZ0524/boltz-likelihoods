@@ -803,7 +803,7 @@ def cli() -> None:
 )
 @click.option(
     "--mode",
-    type=click.Choice(["predict_diff", "predict_pfode", "langevin", "likelihood"]),
+    type=click.Choice(["predict_diff", "predict_pfode", "langevin", "likelihood", "umbrella"]),
     help="The type of inference to do.",
     default="predict_diff",
 )
@@ -830,11 +830,8 @@ def cli() -> None:
     type=click.Path(exists=True),
     help=(
         "Path to directory containing files to initialize prediction "
-        "head with. The directory must contain tensors.hdf5 and " 
-        "feats.json files (score network conditioning tensors). "
-        "Ann input.pdb file can also be contained (optional Langevin "
-        "sampling starting structure, required likelihood calculation "
-        "structure). "
+        "head with. Required for likelihood calculation and umbrella "
+        "sampling."
         "If a valid directory is provided, the input prep and "
         "Pairformer steps are skipped. The diffusion rollout is also "
         "skipped for Langevin sampling if the pdb is also given."
@@ -923,6 +920,30 @@ def cli() -> None:
         "The number of samples to compute in parallel for the ODE likelihood calculation."
         "Default is 1."
     )
+)
+@click.option(
+    "--umbrella_steps",
+    type=int,
+    default=100000,
+    help=(
+        "The number of simulation steps for each umbrella sampling window."
+        "Default is 1."
+    )
+)
+@click.option(
+    "--umbrella_json",
+    type=click.Path(exists=True),
+    help="The path to the umbrella.json file containing umbrella sampling centers and parameters.",
+    default=None
+)
+@click.option(
+    "--umbrella_functor_path",
+    type=click.Path(exists=True),
+    help=(
+        "The path to the .py file which contains the functor class to compute "
+        "CVs for the given umbrella sampling system."
+    ),
+    default=None
 )
 @click.option(
     "--write_full_pae",
@@ -1093,6 +1114,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     likelihood_mode: str = 'jac',
     hutchinson_samples: int = 1,
     ode_batch_size: int = 1,
+    umbrella_steps: int = 100000,
+    umbrella_json: str = None,
+    umbrella_functor: str = None,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1349,8 +1373,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 torch.save(ckpt, cache / "boltz1_noconfidence.ckpt")
             checkpoint = cache / "boltz1_noconfidence.ckpt"
 
-        # Fairscale checkpointing off for likelihood calcs.
-        if mode == 'likelihood':
+        # Fairscale checkpointing off for likelihood and umbrella calcs.
+        if mode == 'likelihood' or mode == 'umbrella':
             ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
             score_model_args = ckpt['hyper_parameters']['score_model_args']
             score_model_args['activation_checkpointing'] = False # Allow gradient tracking.
@@ -1420,6 +1444,16 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     "calculation."
                 )
             
+        if mode == 'umbrella':
+            if umbrella_json is None:
+                raise ValueError(
+                    "--umbrella_json is required for umbrella sampling."
+                )
+            if umbrella_functor is None:
+                raise ValueError(
+                    "--umbrella_functor is required for umbrella sampling."
+                )
+            
         head_init = Path(head_init).expanduser().resolve() if head_init else None         
         likelihood_args = ode_args.copy()
         likelihood_args['outdir'] = out_dir
@@ -1433,14 +1467,14 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         model_module.save_conditioning_args = save_conditioning_args
         model_module.mode = mode
 
-        if mode != 'likelihood':
+        if mode != 'likelihood' and mode != 'umbrella':
             trainer.predict(
                 model_module,
                 datamodule=data_module,
                 return_predictions=False,
             )
 
-        else: # Need gradient tracking for PFODE integration.
+        else: # Need gradients for PFODE integration/umbrella force calculation.
             predict_loader = data_module.predict_dataloader()
             device = "cuda" if accelerator == "gpu" else "cpu"
 
@@ -1455,7 +1489,17 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                         feats_fixed[k] = v
                 feats = feats_fixed
                 with torch.set_grad_enabled(True):
-                    model_module.likelihood(feats, recycling_steps)
+                    if mode == 'likelihood':
+                        model_module.likelihood(feats, recycling_steps)
+                    else:
+                        model_module.umbrella(
+                            feats, 
+                            diffusion_stop,
+                            recycling_steps, 
+                            umbrella_steps,
+                            umbrella_json,
+                            umbrella_functor
+                        )
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):
