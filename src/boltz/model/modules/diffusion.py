@@ -37,12 +37,19 @@ from boltz.model.modules.utils import (
 )
 from boltz.model.potentials.potentials import get_potentials
 
+from boltz.lutils.cvs import CLASS_REGISTRY
+
+from openmm.app import *
+from openmm import *
+import openmm.unit as unit
+
 from torchdiffeq import odeint
 import torchode as to
 from einops import rearrange, repeat, reduce, einsum
 import h5py
 import os
 import json
+import numpy as np
 
 from tqdm import tqdm
 import time
@@ -1301,6 +1308,137 @@ class AtomDiffusion(Module):
         with open(outdir / "likelihoods.json", "w") as f:
             json.dump(results, f, indent=2)
 
+    def run_umbrella(
+        self,
+        coord_sets,
+        umbrella_steps,
+        param_dict,
+        umbrella_functor,
+        diffusion_stop,
+        **network_condition_kwargs
+    ):  
+        
+        # Setting up CV functor.
+        if umbrella_functor not in CLASS_REGISTRY:
+            raise ValueError(
+                f"Unknown class '{umbrella_functor}'. "
+                f"Available: {list(CLASS_REGISTRY)}"
+            )
+        
+        functor_class = CLASS_REGISTRY[umbrella_functor]
+        calc_cv = functor_class()
+
+        sigmas = self.sample_schedule(200)
+        gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
+        sigma_tm, _, gamma = sigmas_and_gammas[diffusion_stop]
+        sigma_tm, gamma = sigma_tm.item(), gamma.item()
+        t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
+
+        # Running umbrella window for each pre-defined window.
+        for (coords, pdb_file, pdb_dict) in tqdm(
+            zip(coord_sets, param_dict.items()),
+            desc='Doing umbrella sampling for windows',
+            mininterval=100
+        ):
+            # Setting up OMM system.
+            pdb = PDBFile(pdb_file)
+            forcefield = ForceField("amber14-all.xml")  # Arbitrary ff. 
+            system = forcefield.createSystem(
+                pdb.topology,
+                nonbondedMethod=NoCutoff,
+                constraints=None
+            )
+            n_atoms = system.getNumParticles()
+
+            # Removing all forces - we only use custom forces.
+            while system.getNumForces() > 0:
+                system.removeForce(0)
+            
+            # Setting up umbrella force. 
+            umbrella_force = CustomExternalForce("fx*x + fy*y + fz*z")
+            umbrella_force.addPerParticleParameter("fx")
+            umbrella_force.addPerParticleParameter("fy")
+            umbrella_force.addPerParticleParameter("fz")
+            for i in range(n_atoms):
+                umbrella_force.addParticle(i, [0.0, 0.0, 0.0])
+            system.addForce(umbrella_force)
+
+            # Setting up score module force.
+            nn_force = CustomExternalForce("-fx*x - fy*y - fz*z")
+            nn_force.addPerParticleParameter("fx")
+            nn_force.addPerParticleParameter("fy")
+            nn_force.addPerParticleParameter("fz")
+            for i in range(n_atoms):
+                nn_force.addParticle(i, [0.0, 0.0, 0.0]) 
+            system.addForce(nn_force)
+
+            # Setting up integrator and context.
+            dt = 0.002 * unit.picoseconds
+            temperature = 300 * unit.kelvin
+            friction = 1.0 / unit.picosecond
+
+            integrator = LangevinIntegrator(temperature, friction, dt)
+            platform = Platform.getPlatformByName("GPU")
+            context = Context(system, integrator, platform)
+            init_positions = coords
+            context.setPositions(init_positions)
+
+            for steps in tqdm(
+                range(umbrella_steps),
+                desc='Running trajectory for a window',
+                mininterval=30
+            ):
+                # Get positions from OpenMM.
+                state = context.getState(getPositions=True)
+                coords_nm = torch.tensor(
+                    state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+                    dtype=torch.float32
+                )
+
+                # Computing score module 'force' and adding them to system. 
+                atom_coords_denoised, _ = \
+                    self.preconditioned_network_forward(
+                        coords_nm * 10, # Converting to angstroms for Boltz.
+                        t_hat,
+                        training=False,
+                        network_condition_kwargs=dict(
+                            multiplicity=1,
+                            model_cache={},
+                            **network_condition_kwargs,
+                        ),
+                    )
+
+                f_nn = (atom_coords_denoised - (coords_nm * 10)) / (t_hat ** 2) # Using the score as the force.
+
+                for i in range(n_atoms):
+                    nn_force.setParticleParameters(i, i, f_nn[i].tolist())
+                nn_force.updateParametersInContext(context)
+
+                '''
+                To compute umbrella forces, we need to use chain rule to 
+                relate changes in CV to changes in atomic positions.
+
+                Since we use a harmonic potential for the umbrella bias 
+                in CV space, we have dU/dCV = k_umb * (CV - CV0), where 
+                CV0 is the window center.
+
+                Then, we need dCV/dR, which we compute using torch grad.
+                '''
+                cv0 = np.array(pdb_dict['cv0'])
+                k_umb = pdb_dict['k']
+
+                coords_nm.requires_grad_()
+                cv = calc_cv(coords_nm)
+                diff = cv - cv0
+                u_umb = 0.5 * k_umb * torch.sum(diff ** 2)
+                f_umb = torch.autograd.grad(u_umb, coords_nm, create_graph=True)[0]
+
+                for i in range(n_atoms):
+                    umbrella_force.setParticleParameters(i, i, f_umb[i].tolist())
+                umbrella_force.updateParametersInContext(context)
+
+                integrator.step(1)
     def calc_likelihoods_ips(
         self,
         input_coords=None,

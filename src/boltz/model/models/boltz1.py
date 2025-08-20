@@ -6,6 +6,7 @@ import mdtraj as md
 import numpy as np
 from pathlib import Path
 import glob
+import json
 from typing import Any, Optional
 
 import torch
@@ -43,7 +44,7 @@ from boltz.model.modules.trunk import (
 from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
-import boltz.data.const
+from boltz.lutils.pdb_processing import pdb_to_boltz_coords
 
 class Boltz1(LightningModule):
     """Boltz1 model."""
@@ -351,109 +352,20 @@ class Boltz1(LightningModule):
                 'provided path correct?'
             )
 
-        ref_atoms = const.ref_atoms
-        has_ace = False
-
         yaml_seq = sequences[0] # TODO: assumes that the input is single-chain.
-        yaml_seq_3 = [
-            const.prot_letter_to_token[res] for res in yaml_seq
-        ] # eg. [TYR, ARG, LEU]
-        mismatch_errors = {}
-
-        # Doing error checks on provided PDB files.
-        for file in sorted(pdb_files):
-            init_pdb = md.load(file)
-            prot = init_pdb.topology.select("protein")
-            pdb = init_pdb.atom_slice(prot)
-            pdb_seq = []
-
-            for i, residue in enumerate(pdb.topology.residues):
-                pdb_seq.append(residue.code)
-
-            # Check if there are any other non-canonical AAs in the PDB.
-            # (Excluding ACE and NME).
-            noncanonical_indices = [
-                i + 1 for i, res in enumerate(pdb_seq) 
-                if res is None and i != 0 and i != (len(pdb_seq) - 1)
-            ] 
-
-            if len(noncanonical_indices) > 0:
-                mismatch_errors[file] = (
-                    f"Noncanonical residues found at the following "
-                    f"indices: {noncanonical_indices}."
-                )
-                continue
-
-            # Removing ACE and NME, if present. # TODO: this is not robust.
-            if pdb_seq[-1] is None:
-                pdb_seq = pdb_seq[:-1]
-
-            if pdb_seq[0] is None:
-                pdb_seq = pdb_seq[1:]
-                has_ace = True
-
-            # If there are no non-canonical AAs and ACE/NMEs are
-            # removed, now, pdb_seq should match exactly with yaml_seq.
-            if "".join(pdb_seq) != yaml_seq:
-                mismatch_errors[file] = (
-                    f"Mismatched sequences."
-                )
-
-        if len(mismatch_errors) != 0:
-            errors = [
-                f"For file {k} the following error occurred: {v}"
-                for k, v in mismatch_errors.items()
-            ]
-            raise Exception("\n".join(errors))
-
-        '''If no errors occurred, we can process PDB coordinates safely.
-        Iterating over the yaml sequence's residues, we use Boltz's 
-        canonical internal ordering to fetch PDB atom coordinates in the 
-        proper order.'''
         pdb_names = []
         all_coords = []
+        
         for file in sorted(pdb_files):
-            init_pdb = md.load(file)
-            prot = init_pdb.topology.select("protein")
-            pdb = init_pdb.atom_slice(prot)
-            coord_list = []
-
-            atom_coords = {
-                str(list(pdb.topology.atoms)[i]): pdb.xyz[0][i] 
-                for i in range(len(pdb.xyz[0]))
-            } # Keys: eg. 'ACE1-H1'. Values: eg. [0.2, 0.3, 0.1]
-
-            # # For PDB proteins, the chain might not start on residue 1.
-            first_atom = str(list(pdb.topology.atoms)[0]) # eg. LYS1-N
-            first_res_idx = int(first_atom[3])
-
-            start = first_res_idx + 1 if has_ace else first_res_idx
-            for i, res in enumerate(yaml_seq_3, start=start):
-                boltz_atom_ordering = ref_atoms[res]
-                for atom in boltz_atom_ordering:
-                    atom_fullname = f'{res}{i}-{atom}'
-                    try:
-                        coord_list.append(atom_coords[atom_fullname])
-                    except:
-                        raise Exception(
-                            f'A Boltz canonical atom {str(atom)} is '
-                            f'missing in PDB {file}, residue {res}{i}.'
-                        )
-
-            # Finding the padding dimension for coord_tensor
-            padding_dim = atom_mask.shape[-1]
-            coord_tensor = torch.from_numpy(np.stack(coord_list)).to(self.device)
-            rows_to_pad = padding_dim - coord_tensor.shape[0]
-            if rows_to_pad < 0: # TODO: in principle, this shouldn't be necessary anymore
-                print(
-                    f'Provided PDB {file} has more atoms than the '
-                    f'input conditioning tensors. Skipping.'
-                )
-                continue
-            pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
-            pdb_coords = pdb_coords - pdb_coords.mean(dim=0, keepdim=True) # Centering to origin.
-            all_coords.append(pdb_coords * 10) # Converting to angstroms.
-            pdb_names.append(file)
+            coords = pdb_to_boltz_coords(
+                pdb_file=file,
+                yaml_seq=yaml_seq,
+                atom_mask=atom_mask,
+                device=self.device
+            )
+            if coords is not None:
+                all_coords.append(coords) # pdb_to_boltz_coords outputs are in angstroms.
+                pdb_names.append(file)
         
         if len(all_coords) > 0:
             input_coords = {
@@ -609,6 +521,76 @@ class Boltz1(LightningModule):
                 input_coords=input_coords,
                 likelihood_args=self.likelihood_args,
             )
+
+    def umbrella(
+        self,
+        feats,
+        diffusion_stop,
+        recycling_steps,
+        umbrella_steps,
+        umbrella_json,
+        umbrella_functor
+    ):
+        """Outer wrapper of umbrella sampling calculations.
+
+        Checks head_init inputs - if no Pairformer outputs are provided, 
+        runs the Pairformer. Checks if the required umbrella.json is 
+        provided and processes it if it does (throws an error if not). 
+
+        Parameters
+        ----------
+
+        """
+        atom_mask = feats["atom_pad_mask"]
+    
+        chains = feats["record"][0].chains
+        sequences = [chain.sequence for chain in chains]
+        tensor_dict, pdistogram, _ = self._load_head_init(sequences, feats["atom_pad_mask"])
+
+        # Run the Pairformer only if not given pre-computed Pairformer outputs.
+        if tensor_dict is None:
+            tensor_dict, pdistogram = self._run_pairformer(
+                feats,
+                recycling_steps
+            )
+
+        dict_out = {'pdistogram': pdistogram}
+        s = tensor_dict['s']
+        z = tensor_dict['z']
+        s_inputs = tensor_dict['s_inputs']
+        relative_position_encoding = tensor_dict['relative_position_encoding']
+        
+        with open(umbrella_json, 'r') as file:
+            param_dict = json.load(file)
+
+        coord_list = []
+
+        for (pdb_file, _) in param_dict.items():
+            coord_list.append(pdb_to_boltz_coords(
+                pdb_file=pdb_file,
+                yaml_seq=sequences[0],
+                atom_mask=atom_mask,
+                device=self.device
+            ))
+        coord_sets = torch.stack(coord_list, axis=0)
+        
+    
+        self.structure_module.run_umbrella(
+            coord_sets=coord_sets,
+            umbrella_steps=umbrella_steps,
+            param_dict=param_dict,
+            umbrella_functor=umbrella_functor,
+            diffusion_stop=diffusion_stop,
+            s_trunk=s,
+            z_trunk=z,
+            s_inputs=s_inputs, # Pre-trunk token-level sequence.
+            feats=feats,
+            relative_position_encoding=relative_position_encoding,
+        )
+            
+
+
+        
 
     def forward(
         self,
