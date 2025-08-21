@@ -942,7 +942,7 @@ def cli() -> None:
     default=None
 )
 @click.option(
-    "--umbrella_functor_path",
+    "--umbrella_functor",
     type=click.Path(exists=True),
     help=(
         "The path to the .py file which contains the functor class to compute "
@@ -1505,7 +1505,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                             recycling_steps, 
                             umbrella_steps,
                             umbrella_json,
-                            umbrella_functor
+                            umbrella_functor,
+                            out_dir / "trajectories",
                         )
 
     # Check if affinity predictions are needed
