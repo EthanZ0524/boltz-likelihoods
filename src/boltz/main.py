@@ -942,7 +942,7 @@ def cli() -> None:
     default=None
 )
 @click.option(
-    "--umbrella_functor_path",
+    "--umbrella_functor",
     type=click.Path(exists=True),
     help=(
         "The path to the .py file which contains the functor class to compute "
