@@ -927,6 +927,12 @@ def cli() -> None:
     help="Whether to use the Importance Sampling (IS) likelihood estimation."
 )
 @click.option(
+    "--num_mc_samples",
+    type=int,
+    default=1000,    
+    help="How many Monte Carlo samples to use for the IS likelihood estimation. Default is 1000."
+)
+@click.option(
     "--umbrella_steps",
     type=int,
     default=100000,
@@ -1120,6 +1126,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     hutchinson_samples: int = 1,
     ode_batch_size: int = 1,
     ips_likelihood: bool = False,
+    num_mc_samples: int = 1000,
     umbrella_steps: int = 100000,
     umbrella_json: str = None,
     umbrella_functor: str = None,
@@ -1467,6 +1474,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         likelihood_args['hutchinson_samples'] = hutchinson_samples
         likelihood_args['ode_batch_size'] = ode_batch_size
         likelihood_args['ips_likelihood'] = ips_likelihood
+        likelihood_args['num_mc_samples'] = num_mc_samples
         model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir
