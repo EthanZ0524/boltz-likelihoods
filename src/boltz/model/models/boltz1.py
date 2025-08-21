@@ -529,7 +529,8 @@ class Boltz1(LightningModule):
         recycling_steps,
         umbrella_steps,
         umbrella_json,
-        umbrella_functor
+        umbrella_functor,
+        outdir
     ):
         """Outer wrapper of umbrella sampling calculations.
 
@@ -539,7 +540,11 @@ class Boltz1(LightningModule):
 
         Parameters
         ----------
+        umbrella_steps : int
+            Number of simulation steps to run per umbrella window.
 
+        umbrella_json : str
+            Path to 
         """
         atom_mask = feats["atom_pad_mask"]
     
@@ -573,7 +578,6 @@ class Boltz1(LightningModule):
                 device=self.device
             ))
         coord_sets = torch.stack(coord_list, axis=0)
-        
     
         self.structure_module.run_umbrella(
             coord_sets=coord_sets,
@@ -581,6 +585,7 @@ class Boltz1(LightningModule):
             param_dict=param_dict,
             umbrella_functor=umbrella_functor,
             diffusion_stop=diffusion_stop,
+            outdir=outdir,
             s_trunk=s,
             z_trunk=z,
             s_inputs=s_inputs, # Pre-trunk token-level sequence.
@@ -588,10 +593,6 @@ class Boltz1(LightningModule):
             relative_position_encoding=relative_position_encoding,
         )
             
-
-
-        
-
     def forward(
         self,
         feats: dict[str, Tensor],
