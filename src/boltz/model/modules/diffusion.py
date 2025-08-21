@@ -1315,9 +1315,11 @@ class AtomDiffusion(Module):
         param_dict,
         umbrella_functor,
         diffusion_stop,
+        outdir,
         **network_condition_kwargs
     ):  
-        
+        outdir = outdir.expanduser().resolve(strict=False)
+        outdir.mkdir(parents=True, exist_ok=True)
         # Setting up CV functor.
         if umbrella_functor not in CLASS_REGISTRY:
             raise ValueError(
@@ -1336,11 +1338,11 @@ class AtomDiffusion(Module):
         t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
 
         # Running umbrella window for each pre-defined window.
-        for (coords, pdb_file, pdb_dict) in tqdm(
+        for i, (coords, pdb_file, pdb_dict) in tqdm(enumerate(
             zip(coord_sets, param_dict.items()),
             desc='Doing umbrella sampling for windows',
             mininterval=100
-        ):
+        )):
             # Setting up OMM system.
             pdb = PDBFile(pdb_file)
             forcefield = ForceField("amber14-all.xml")  # Arbitrary ff. 
@@ -1398,7 +1400,7 @@ class AtomDiffusion(Module):
 
                 # Computing score module 'force' and adding them to system. 
                 atom_coords_denoised, _ = \
-                    self.preconditioned_network_forward(
+                    self.preconditioned_network_forward( # TODO: does this need to get padded?
                         coords_nm * 10, # Converting to angstroms for Boltz.
                         t_hat,
                         training=False,
@@ -1438,7 +1440,42 @@ class AtomDiffusion(Module):
                     umbrella_force.setParticleParameters(i, i, f_umb[i].tolist())
                 umbrella_force.updateParametersInContext(context)
 
+                # Writing coordinate + CV energy data.
+                # with h5py.File(str(outdir / 'umbrella.hdf5'), "a") as f:
+                #     if f'traj_{i}' not in f:
+                #         traj_dset = f.create_dataset(
+                #             "traj",
+                #             shape=(0, *atom_coords_unpadded_shape),
+                #             maxshape=(None, *atom_coords_unpadded_shape),
+                #             dtype='float32',
+                #             chunks=(1, *atom_coords_unpadded_shape)
+                #         )
+                #     else:
+                #         traj_dset = f['traj']
+
+                #     if 'scores' not in f:
+                #         score_dset = f.create_dataset(
+                #             "scores",
+                #             shape=(0, *atom_coords_unpadded_shape),
+                #             maxshape=(None, *atom_coords_unpadded_shape),
+                #             dtype='float32',
+                #             chunks=(1, *atom_coords_unpadded_shape)
+                #         )
+                #     else:
+                #         score_dset = f['scores']
+
+                #     # Unpad, write the score + coordinates and update.
+                #     coords_unpadded = atom_coords_next[:, atom_mask[0].bool(), :]
+                #     coords_np = coords_unpadded.cpu().numpy()
+                #     traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
+                #     traj_dset[-1, :, :, :] = coords_np
+
                 integrator.step(1)
+
+                
+
+
+
     def calc_likelihoods_ips(
         self,
         input_coords=None,
