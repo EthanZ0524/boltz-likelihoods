@@ -1648,7 +1648,7 @@ class AtomDiffusion(Module):
             x_min = struct.view(1, -1)  # Reshape to (1, n_padded_atoms * 3)
             x_min = x_min.repeat(num_mc_samples, 1)  # Repeat for number of MC samples
 
-            ascending_time = sigmas.clone()[::-1]  # Reverse order for forward path (ascending time)
+            ascending_time = torch.flip(sigmas.clone(), dims=[0])  # Reverse order for forward path (ascending time)
 
             x_path, log_path_weights_fwd = forward_path_em(
                 x_min,
