@@ -128,8 +128,8 @@ def pdb_to_boltz_coords(
             f'input conditioning tensors. Skipping.'
         )
         return None
+    coord_tensor = coord_tensor - coord_tensor.mean(dim=0, keepdim=True) # Centering to origin.
     pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
-    pdb_coords = pdb_coords - pdb_coords.mean(dim=0, keepdim=True) # Centering to origin.
     pdb_coords *= 10 # Converting to angstroms.
 
     return pdb_coords
