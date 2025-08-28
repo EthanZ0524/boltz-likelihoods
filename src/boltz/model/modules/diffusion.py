@@ -1482,7 +1482,7 @@ class AtomDiffusion(Module):
         likelihood_args=None,
         **network_condition_kwargs,
     ):
-        """Does mcmc likelihood calculation using Importance Path Sampling
+        """Does monte carlo likelihood calculation using Importance Path Sampling
         
         Parameters
         ----------
@@ -1516,38 +1516,52 @@ class AtomDiffusion(Module):
         -----
         calc_likelihoods' sigma_min and sigma_max values are those of
         the default diffusion rollout's (ie. hardcoded, see line below).
+
+        Effective sample size (ESS) is computed as 
+        ESS = (sum w_i)^2 / sum(w_i^2), where w_i are the importance weights 
+        in non-log space; this quantifies the number of independent samples 
+        contributing to the estimate after weighting.
         """
         num_sampling_steps = self.num_sampling_steps # 200 by default.
         num_mc_samples = likelihood_args.get('num_mc_samples', 1000)
         sigmas = self.sample_schedule(num_sampling_steps) # goes from T_max to 0.
+        print("sigmas shape:", sigmas.shape)
         results = {}
+
+        outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
+        # save the state dict of network_condition_kwargs
+        torch.save(network_condition_kwargs, outdir / "network_condition_kwargs.pth")
+        # save the input coords
+        torch.save(input_coords, outdir / "input_coords.pth")
 
         def _score_fn_batch_reshaped(coords, sigma): 
             # takes in the coords of shape (batch, n_padded_atoms * 3),
             # reshapes it to (batch, n_padded_atoms, 3) and computes the score.
             # and then returns the score in shape (batch, n_padded_atoms * 3)
+            # coords are now already on GPU
             batch_size, data_dim = coords.shape
-            coords = coords.view(batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
+            coords_gpu = coords.view(batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
             # center the coordinates to origin
-            coords = coords - coords.mean(dim=1, keepdim=True)
+            coords_gpu = coords_gpu - coords_gpu.mean(dim=1, keepdim=True)
             denoised, _ = self.preconditioned_network_forward(
-                coords,  # add batch dimension
+                coords_gpu,  # add batch dimension
                 sigma.item(),
                 training=False,
                 network_condition_kwargs=dict(
-                    multiplicity=1,
+                    multiplicity=batch_size,  # Changed from 1 to batch_size
                     model_cache={},
                     **network_condition_kwargs,
                 ),
             )
-            score = ((denoised - coords) / (sigma ** 2)) # (batch_size, n_padded_atoms, 3)
+            score = ((denoised - coords_gpu) / (sigma ** 2)) # (batch_size, n_padded_atoms, 3)
             score = score.view(batch_size, -1)  # Reshape back to (batch_size, n_padded_atoms * 3)
-            return score
+            return score  # Keep on GPU
         
         def forward_path_em(starting_coords, timepoints):
             """
             Evolve the sample in forward time using the Euler-Maruyama discretization.
             Also collects the path weights for importance sampling.
+            Trajectory is kept on GPU for faster computation.
 
             Parameters
             ----------
@@ -1561,38 +1575,45 @@ class AtomDiffusion(Module):
             Returns
             -------
             coords_path : torch.tensor of shape (len(timepoints), batch, n_padded_atoms * 3)
-                Path of coordinates at each time step.
+                Path of coordinates at each time step (on GPU).
             log_path_weights : torch.tensor of shape (batch,)
-                Logarithm of the path weights for importance sampling.
+                Logarithm of the path weights for importance sampling (on GPU).
             """
             batch_size, data_dim = starting_coords.shape # should be n_padded_atoms * 3
-            coords_path = starting_coords.new_zeros(
+            # Keep trajectory on GPU for faster computation
+            starting_coords_gpu = starting_coords.to(self.device)
+            coords_path = starting_coords_gpu.new_zeros(
                 (len(timepoints), batch_size, data_dim)
             )
-            coords_path[0] = starting_coords
-            log_path_weights = starting_coords.new_zeros((batch_size), dtype=torch.float32)
-            for i in range(len(timepoints) - 1):
+            coords_path[0] = starting_coords_gpu
+            log_path_weights = starting_coords_gpu.new_zeros((batch_size), dtype=torch.float32)
+            for i in range(len(timepoints)-1):
                 coords = coords_path[i]
                 sigma = timepoints[i]
+
                 next_sigma = timepoints[i + 1]
                 delta_t = next_sigma - sigma
                 dW = torch.randn_like(coords_path[0]) * torch.sqrt(delta_t)
                 # Karras uses f = 0, g(t) = sqrt(2t) 
                 # noising kernel is then dX_t = sqrt(2t) * dW_t so X_{t+dt} ~ N(X_t, 2t * dt I)
-
-                new_coords = coords + (2 * sigma).sqrt() * dW
+                if not (torch.isclose(sigma, torch.zeros_like(sigma)) or torch.isclose(delta_t, torch.zeros_like(sigma))) :
+                    new_coords = coords + torch.sqrt(2 * sigma) * dW
+                    log_path_weights -= (1 / (4 * delta_t * sigma)) * torch.norm(coords - new_coords, dim=-1)**2  # quadratic term
+                else:
+                    new_coords = coords.clone()
                 coords_path[i + 1] = new_coords
-                log_path_weights -= (1 / (4 * delta_t * sigma)) * torch.norm(coords - new_coords, dim=-1)**2  # quadratic term
+
             return coords_path, log_path_weights
         
         def log_path_measure_reverse_time(forward_trajectory, timesteps, score_model):
             """
             Calculate path measure under reverse-time dynamics
+            Trajectory is on GPU for faster computation.
             
             Parameters
             ----------
             forward_trajectory : torch.tensor of shape (num_timesteps, batch, n_padded_atoms * 3)
-                Trajectory in forward time.
+                Trajectory in forward time (on GPU).
             
             timesteps : list of floats
 
@@ -1602,23 +1623,24 @@ class AtomDiffusion(Module):
                 Function that computes the score(x,t) at given coordinates and time.
 
             Returns
-            -------
+            log_p = torch.zeros(forward_trajectory.shape[1], dtype=forward_trajectory.dtype, device=self.device)
             log_p : torch.tensor of shape (batch,)
-                Logarithm of the path measure under reverse-time dynamics.
+                Logarithm of the path measure under reverse-time dynamics (on GPU).
             """
-            log_p = torch.zeros(forward_trajectory.shape[-1], dtype=torch.float32)
-            
+            log_p = torch.zeros(forward_trajectory.shape[1], dtype=torch.float32, device=self.device)
+
             # Iterate backwards through the forward trajectory
             for i in range(len(timesteps) - 1):
                 t = timesteps[-(i+1)]  # Current time (going backwards)
                 delta_t = timesteps[-(i+1)] - timesteps[-(i+2)]  # Keep positive dt
 
                 # States: current (later in forward time) and next (earlier in forward time)
-                curr_x = forward_trajectory[-(i+1), :, :]
-                next_x = forward_trajectory[-(i+2), :, :] if i < len(timesteps) - 2 else forward_trajectory[0, :, :]
+                curr_x = forward_trajectory[-(i+1), :, :]  # On GPU
+                next_x = forward_trajectory[-(i+2), :, :] if i < len(timesteps) - 2 else forward_trajectory[0, :, :]  # On GPU
                 
                 # Reverse-time drift: f - g²s
-                score = score_model(curr_x, t)
+                # score_model now works with GPU tensors
+                score = score_model(curr_x, t)  # Returns result on GPU
                 diffusion_sq = 2 * t
                 reverse_drift = - (diffusion_sq * score)
                 
@@ -1645,11 +1667,10 @@ class AtomDiffusion(Module):
             
             sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
             t = struct.new_tensor([sigma_min, sigma_max])
-            x_min = struct.view(1, -1)  # Reshape to (1, n_padded_atoms * 3)
+            x_min = struct.view(1, -1).to(self.device)  # Reshape to (1, n_padded_atoms * 3) and move to GPU
             x_min = x_min.repeat(num_mc_samples, 1)  # Repeat for number of MC samples
 
-            ascending_time = torch.flip(sigmas.clone(), dims=[0])  # Reverse order for forward path (ascending time)
-
+            ascending_time = torch.flip(sigmas.clone(), dims=[0])  # Keep time on same device as sigmas
             x_path, log_path_weights_fwd = forward_path_em(
                 x_min,
                 ascending_time
@@ -1661,15 +1682,30 @@ class AtomDiffusion(Module):
                 _score_fn_batch_reshaped
             )
 
-            latent = x_path[-1]  # Last step in the forward path
+            latent = x_path[-1]  # Last step in the forward path (on GPU)
 
-            ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent.flatten()).sum()
+            # ll_prior = torch.distributions.Normal(0, sigma_max.cpu()).log_prob(latent.flatten()).sum()
+            ll_prior = torch.distributions.MultivariateNormal(torch.zeros(latent.shape[-1], device=self.device), sigma_max**2 * torch.eye(latent.shape[-1], device=self.device)).log_prob(latent)
 
             # take the average in non-log space
-            log_likelihoods = log_path_weights_fwd + log_path_weights_rev + ll_prior.item()
+            # All tensors are on GPU now
+            log_likelihoods = log_path_weights_rev + ll_prior - log_path_weights_fwd
             log_mean_likelihood = torch.logsumexp(log_likelihoods, dim=0) - torch.log(torch.tensor(num_mc_samples, dtype=torch.float32, device=self.device))
 
-            results[pdb_name] = log_mean_likelihood.item()
+            # normalized_log_weights = log_likelihoods - torch.logsumexp(log_likelihoods, dim=0)  # Normalize log weights
+            # log_effective_sample_size = -torch.logsumexp(2 * normalized_log_weights, dim=0)  # log(1/sum(w_i^2)) = -logsumexp(2 log(w_i))
+
+            log_weights_shifted = log_likelihoods - log_likelihoods.max()  # For numerical stability
+
+            # ESS = (sum w_i)^2 / sum(w_i^2)
+            log_sum_weights = torch.logsumexp(log_weights_shifted, dim=0)  # log(sum w_i)
+            log_sum_weights_squared = torch.logsumexp(2 * log_weights_shifted, dim=0)  # log(sum w_i^2)
+
+            log_ess = 2 * log_sum_weights - log_sum_weights_squared
+
+            results[pdb_name] = {"logp": log_mean_likelihood.item(),
+                                 "effective_sample_size": log_ess.exp().item(),
+                                 "num_mc_samples": num_mc_samples}
             endtime = time.time()
             runtimes.append(endtime - start_time)
             print(f'{pdb_name} took  {endtime - start_time:.2f} seconds')
