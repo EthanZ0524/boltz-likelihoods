@@ -1503,7 +1503,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     else:
                         feats_fixed[k] = v
                 feats = feats_fixed
-                with torch.set_grad_enabled(True):
+
+                set_grad_enabled = ((mode == 'likelihood' or mode == 'umbrella') and not ips_likelihood)
+                print("Grad enabled:", set_grad_enabled)
+                with torch.set_grad_enabled(set_grad_enabled):
                     if mode == 'likelihood':
                         model_module.likelihood(feats, recycling_steps)
                     else:
