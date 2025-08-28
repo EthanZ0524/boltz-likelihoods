@@ -230,6 +230,7 @@ class Boltz1(LightningModule):
                 "atom_feature_dim": atom_feature_dim,
                 **score_model_args,
             },
+            num_sampling_steps=self.predict_args["sampling_steps"],
             compile_score=compile_structure,
             accumulate_token_repr=use_accumulate_token_repr,
             **diffusion_process_args,
