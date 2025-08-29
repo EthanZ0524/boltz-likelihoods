@@ -358,7 +358,7 @@ class Boltz1(LightningModule):
         all_coords = []
         
         for file in sorted(pdb_files):
-            coords = pdb_to_boltz_coords(
+            coords, _, _ = pdb_to_boltz_coords(
                 pdb_file=file,
                 yaml_seq=yaml_seq,
                 atom_mask=atom_mask,
@@ -531,6 +531,8 @@ class Boltz1(LightningModule):
         umbrella_steps,
         umbrella_json,
         umbrella_functor,
+        umbrella_top,
+        umbrella_temp,
         outdir
     ):
         """Outer wrapper of umbrella sampling calculations.
@@ -546,38 +548,44 @@ class Boltz1(LightningModule):
 
         umbrella_json : str
             Path to 
+
+        umbrella_temp : float
         """
+        # Retrieving score module conditioning tensors.
         atom_mask = feats["atom_pad_mask"]
     
         chains = feats["record"][0].chains
         sequences = [chain.sequence for chain in chains]
-        tensor_dict, pdistogram, _ = self._load_head_init(sequences, feats["atom_pad_mask"])
+        tensor_dict = None
+        if self.head_init:
+            tensor_dict, _, _ = self._load_head_init(sequences, feats["atom_pad_mask"])
 
-        # Run the Pairformer only if not given pre-computed Pairformer outputs.
-        if tensor_dict is None:
-            tensor_dict, pdistogram = self._run_pairformer(
+        
+        if tensor_dict is None: # Run Pairformer if not pre-computed.
+            tensor_dict, _ = self._run_pairformer(
                 feats,
                 recycling_steps
             )
 
-        dict_out = {'pdistogram': pdistogram}
         s = tensor_dict['s']
         z = tensor_dict['z']
         s_inputs = tensor_dict['s_inputs']
         relative_position_encoding = tensor_dict['relative_position_encoding']
         
+        # Retrieving umbrella simulation input coordinates.
         with open(umbrella_json, 'r') as file:
             param_dict = json.load(file)
 
-        coord_list = []
+        coord_list = []        
 
         for (pdb_file, _) in param_dict.items():
-            coord_list.append(pdb_to_boltz_coords(
+            coords, elements, masses = pdb_to_boltz_coords(
                 pdb_file=pdb_file,
                 yaml_seq=sequences[0],
                 atom_mask=atom_mask,
                 device=self.device
-            ))
+            )
+            coord_list.append(coords)
         coord_sets = torch.stack(coord_list, axis=0)
     
         self.structure_module.run_umbrella(
@@ -585,7 +593,12 @@ class Boltz1(LightningModule):
             umbrella_steps=umbrella_steps,
             param_dict=param_dict,
             umbrella_functor=umbrella_functor,
+            umbrella_top=umbrella_top,
+            umbrella_temp=umbrella_temp,
             diffusion_stop=diffusion_stop,
+            atom_mask=atom_mask,
+            masses=masses,
+            elements=elements,
             outdir=outdir,
             s_trunk=s,
             z_trunk=z,
