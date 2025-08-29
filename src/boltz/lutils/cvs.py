@@ -20,7 +20,7 @@ def register_class(cls):
     return cls
 
 @register_class
-class ChignolinCV:
+class Chignolin:
     """Computes the first two tICA coordinates for Chignolin based on 
     CA atom distances.
 
@@ -30,7 +30,7 @@ class ChignolinCV:
         mdtraj topology of the PDB.
     """
     def __init__(self, top, device="cpu"):
-        base_dir = os.path.dirname(__file__)
+        base_dir = os.path.dirname(os.path.dirname(__file__)) # .../src/boltz/
         means_path = os.path.join(
             base_dir, 
             "assets", "cvs",
@@ -89,5 +89,5 @@ class ChignolinCV:
         distances = torch.linalg.norm(diffs, dim=1)
 
         # tICA projection
-        proj = (distances - self.mean) @ self.eigenvectors
+        proj = (distances - self.means) @ self.eigenvectors
         return proj[:2]  # first 2 tICs
