@@ -45,6 +45,8 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "openpyxl>=3.1.5",
     "torchode>=1.0.0",
+    "seaborn>=0.13.2",
+    "pymbar>=4.0.3",
 ]
 
 [project.scripts]
