@@ -949,12 +949,30 @@ def cli() -> None:
 )
 @click.option(
     "--umbrella_functor",
-    type=click.Path(exists=True),
+    type=str,
     help=(
-        "The path to the .py file which contains the functor class to compute "
-        "CVs for the given umbrella sampling system."
+        "The name of the functor class defined in "
+        "src/boltz/lutils/cvs.py used to compute CVs for the given "
+        "umbrella sampling system."
     ),
     default=None
+)
+@click.option(
+    "--umbrella_top",
+    type=click.Path(exists=True),
+    help=(
+        "A path to the PDB file to use as the topology for the "
+        "'Boltz-ified' umbrella sampling systems."
+    ),
+    default=None
+)
+@click.option(
+    "--umbrella_temp",
+    type=float,
+    help=(
+        "Model's implicit 'temperature' for umbrella simulations."
+    ),
+    default=50.
 )
 @click.option(
     "--write_full_pae",
@@ -1130,6 +1148,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     umbrella_steps: int = 100000,
     umbrella_json: str = None,
     umbrella_functor: str = None,
+    umbrella_top: str = None,
+    umbrella_temp: int = 50,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1478,7 +1498,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir
-        model_module.head_init = str(head_init)
+        if head_init is not None:
+            model_module.head_init = str(head_init)
         model_module.save_conditioning_args = save_conditioning_args
         model_module.mode = mode
 
@@ -1517,7 +1538,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                             umbrella_steps,
                             umbrella_json,
                             umbrella_functor,
-                            out_dir / "trajectories",
+                            umbrella_top,
+                            umbrella_temp, 
+                            out_dir / "umbrella",
                         )
 
     # Check if affinity predictions are needed
