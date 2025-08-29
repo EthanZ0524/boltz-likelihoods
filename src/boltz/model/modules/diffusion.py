@@ -42,6 +42,7 @@ from boltz.lutils.cvs import CLASS_REGISTRY
 from openmm.app import *
 from openmm import *
 import openmm.unit as unit
+import mdtraj as md
 
 from torchdiffeq import odeint
 import torchode as to
@@ -583,9 +584,9 @@ class AtomDiffusion(Module):
 
         Notes
         -----
-        Unlike all other outputs which are written to disk by the
-        prediction writer post-inference, Langevin trajectories are
-        saved on the fly to prevent having to keep large trajectory 
+        Unlike structure prediction outputs which are written to disk 
+        by the prediction writer post-inference, Langevin trajectories 
+        are saved on the fly to prevent having to keep large trajectory 
         tensors in memory.
         """
         sigmas = self.sample_schedule(diffusion_sampling_steps)
@@ -1314,21 +1315,66 @@ class AtomDiffusion(Module):
         umbrella_steps,
         param_dict,
         umbrella_functor,
+        umbrella_top, 
+        umbrella_temp,
         diffusion_stop,
+        atom_mask,
+        masses,
+        elements,
         outdir,
         **network_condition_kwargs
     ):  
+        """Runs umbrella sampling simulations and saves trajectories + 
+        umbrella pulling energies.
+
+        Parameters
+        ----------
+        coord_sets : torch.tensor of shape (n_windows, n_padded_atoms, 3)
+            The (padded) starting coordinates in angstroms for each of 
+            the umbrella windows' simulations.
+
+        umbrella_steps : int
+            The number of simulation steps to run for each umbrella 
+            indow.
+
+        param_dict : dict
+            Keys are filepaths to PDBs of umbrella sampling window
+            simulations' starting conformations. Values are dicts - 
+            subdict has keys 'k' and 'cv0' with values being the
+            umbrella bias strength (float) and the 2-vector (list) 
+            representing the window center in tICA CV space, 
+            respectively.
+
+        umbrella_functor : str
+            The name of the appropriate functor defined in 
+            src/boltz/lutils/cvs.py used to calcualte CV values for the
+            umbrella-sampled protein. 
+        
+        diffusion_stop : int
+            The noise level to use for the score (simulation forces).
+
+        atom_mask : torch.tensor of shape (1, n_padded_atoms)
+            Used to unpad coordinates.
+
+        outdir : pathlib.Path
+            A path to the directory to write results to.
+        """
         outdir = outdir.expanduser().resolve(strict=False)
         outdir.mkdir(parents=True, exist_ok=True)
+
         # Setting up CV functor.
         if umbrella_functor not in CLASS_REGISTRY:
             raise ValueError(
                 f"Unknown class '{umbrella_functor}'. "
                 f"Available: {list(CLASS_REGISTRY)}"
             )
-        
+                
+        # Creating Boltz-ified topology for functor.
+        # Hacky temporary solution: use a Boltz-predicted structure 
+        # as the topology. TODO: make this more robust.
+        top = md.load(umbrella_top).topology
         functor_class = CLASS_REGISTRY[umbrella_functor]
-        calc_cv = functor_class()
+        calc_cv = functor_class(top, device=self.device)
 
         sigmas = self.sample_schedule(200)
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
@@ -1338,27 +1384,31 @@ class AtomDiffusion(Module):
         t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
 
         # Running umbrella window for each pre-defined window.
-        for i, (coords, pdb_file, pdb_dict) in tqdm(enumerate(
-            zip(coord_sets, param_dict.items()),
+        for sim_idx, (init_coords, (pdb_file, pdb_dict)) in tqdm(
+            enumerate(zip(coord_sets, param_dict.items())),
+            total=len(coord_sets),
             desc='Doing umbrella sampling for windows',
-            mininterval=100
-        )):
-            # Setting up OMM system.
-            pdb = PDBFile(pdb_file)
-            forcefield = ForceField("amber14-all.xml")  # Arbitrary ff. 
-            system = forcefield.createSystem(
-                pdb.topology,
-                nonbondedMethod=NoCutoff,
-                constraints=None
-            )
-            n_atoms = system.getNumParticles()
+            position=0
+        ):
+            # Check if the trajectory already exists.
+            if (outdir / f'umbrella_{sim_idx}.hdf5').exists():
+                with h5py.File(str(outdir / f'umbrella_{sim_idx}.hdf5'), "r") as f:
+                    if len(f['traj']) < 5000:
+                        # Remove + restart trajectory if it wasn't finished.
+                        (outdir / f'umbrella_{sim_idx}.hdf5').unlink()
+                    else:
+                        continue # Skip current traj if it was finished.
 
-            # Removing all forces - we only use custom forces.
-            while system.getNumForces() > 0:
-                system.removeForce(0)
+            # Setting up OMM system.
+            pdb = PDBFile(umbrella_top)
+            system = System()
+            for atom in pdb.topology.atoms():
+                system.addParticle(atom.element.mass)
+
+            n_atoms = system.getNumParticles()
             
             # Setting up umbrella force. 
-            umbrella_force = CustomExternalForce("fx*x + fy*y + fz*z")
+            umbrella_force = CustomExternalForce("-fx*x - fy*y - fz*z")
             umbrella_force.addPerParticleParameter("fx")
             umbrella_force.addPerParticleParameter("fy")
             umbrella_force.addPerParticleParameter("fz")
@@ -1376,32 +1426,54 @@ class AtomDiffusion(Module):
             system.addForce(nn_force)
 
             # Setting up integrator and context.
-            dt = 0.002 * unit.picoseconds
-            temperature = 300 * unit.kelvin
+            dt = 0.001 * unit.picoseconds
+            temperature = umbrella_temp * unit.kelvin
             friction = 1.0 / unit.picosecond
 
-            integrator = LangevinIntegrator(temperature, friction, dt)
-            platform = Platform.getPlatformByName("GPU")
+            integrator = LangevinMiddleIntegrator(temperature, friction, dt)
+            platform = Platform.getPlatformByName("OpenCL")
             context = Context(system, integrator, platform)
-            init_positions = coords
+
+            # Unpadding coordinates + sanity checking dimensions.
+            init_coords_unpadded = init_coords[atom_mask.squeeze(0).bool(), :]
+            init_positions = init_coords_unpadded.detach().cpu().numpy() / 10 # Convert to nm for OpenMM.
+
+            if len(init_positions) != n_atoms:
+                raise ValueError(
+                    f"The provided umbrella_top file's number of atoms "
+                    f"({n_atoms}) is not equal to the number "
+                    f"of atoms of the internal Boltz representation "
+                    f"({len(init_positions)})"
+                )
             context.setPositions(init_positions)
 
-            for steps in tqdm(
+            for _ in tqdm(
                 range(umbrella_steps),
                 desc='Running trajectory for a window',
-                mininterval=30
+                mininterval=30,
+                position=1, 
+                leave=False
             ):
                 # Get positions from OpenMM.
                 state = context.getState(getPositions=True)
-                coords_nm = torch.tensor(
+                coords_nm_unpadded = torch.tensor(
                     state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
                     dtype=torch.float32
-                )
+                ).to(self.device) # (n_atoms, 3)
+
+                # Re-padding to match shape with conditioning tensors.
+                padding_dim = atom_mask.shape[-1]
+                rows_to_pad = padding_dim - coords_nm_unpadded.shape[0]
+                coords_nm_padded = F.pad(coords_nm_unpadded, pad=(0, 0, 0, rows_to_pad))
+
+                # Centering + unsqueezing coordinates for score model.
+                coords_nm_padded = coords_nm_padded - coords_nm_padded.mean(dim=0, keepdim=True)
+                coords_nm_padded = coords_nm_padded.unsqueeze(0)
 
                 # Computing score module 'force' and adding them to system. 
                 atom_coords_denoised, _ = \
-                    self.preconditioned_network_forward( # TODO: does this need to get padded?
-                        coords_nm * 10, # Converting to angstroms for Boltz.
+                    self.preconditioned_network_forward(
+                        coords_nm_padded * 10, # Converting to angstroms for Boltz.
                         t_hat,
                         training=False,
                         network_condition_kwargs=dict(
@@ -1411,10 +1483,17 @@ class AtomDiffusion(Module):
                         ),
                     )
 
-                f_nn = (atom_coords_denoised - (coords_nm * 10)) / (t_hat ** 2) # Using the score as the force.
+                # No need to unpad score module output.
+                f_nn = ((atom_coords_denoised - (coords_nm_padded * 10)) / (t_hat ** 2)).squeeze(0)
+
+                # Score is in units of inverse angstroms. Converting to inverse nm.
+                f_nn = f_nn * 10 / unit.nanometer
+                f_nn = f_nn * (unit.BOLTZMANN_CONSTANT_kB * unit.AVOGADRO_CONSTANT_NA).in_units_of(unit.kilojoule_per_mole / unit.kelvin)
+                f_nn = f_nn * umbrella_temp * unit.kelvin
+                force_unit = f_nn.unit
 
                 for i in range(n_atoms):
-                    nn_force.setParticleParameters(i, i, f_nn[i].tolist())
+                    nn_force.setParticleParameters(i, i, f_nn[i].tolist() * force_unit)
                 nn_force.updateParametersInContext(context)
 
                 '''
@@ -1427,54 +1506,56 @@ class AtomDiffusion(Module):
 
                 Then, we need dCV/dR, which we compute using torch grad.
                 '''
-                cv0 = np.array(pdb_dict['cv0'])
+                cv0 = torch.tensor(pdb_dict['cv0']).to(self.device)
                 k_umb = pdb_dict['k']
 
-                coords_nm.requires_grad_()
-                cv = calc_cv(coords_nm)
+                coords_nm_unpadded = coords_nm_unpadded.squeeze(0) # (n_atoms, 3)
+                coords_nm_unpadded.requires_grad_()
+                cv = calc_cv(coords_nm_unpadded)
                 diff = cv - cv0
                 u_umb = 0.5 * k_umb * torch.sum(diff ** 2)
-                f_umb = torch.autograd.grad(u_umb, coords_nm, create_graph=True)[0]
+                f_umb = -torch.autograd.grad(u_umb, coords_nm_unpadded, create_graph=True)[0] # Negative gradient of umbrella potential.
 
                 for i in range(n_atoms):
-                    umbrella_force.setParticleParameters(i, i, f_umb[i].tolist())
+                    umbrella_force.setParticleParameters(i, i, f_umb[i].tolist() * force_unit)
                 umbrella_force.updateParametersInContext(context)
 
                 # Writing coordinate + CV energy data.
-                # with h5py.File(str(outdir / 'umbrella.hdf5'), "a") as f:
-                #     if f'traj_{i}' not in f:
-                #         traj_dset = f.create_dataset(
-                #             "traj",
-                #             shape=(0, *atom_coords_unpadded_shape),
-                #             maxshape=(None, *atom_coords_unpadded_shape),
-                #             dtype='float32',
-                #             chunks=(1, *atom_coords_unpadded_shape)
-                #         )
-                #     else:
-                #         traj_dset = f['traj']
+                # Saving coordinates in units of angstroms.
+                coords_unpadded_shape = coords_nm_unpadded.squeeze(0).shape
+                with h5py.File(str(outdir / f'umbrella_{sim_idx}.hdf5'), "a") as f:
+                    if f'traj' not in f:
+                        traj_dset = f.create_dataset(
+                            f"traj",
+                            shape=(0, *coords_unpadded_shape),
+                            maxshape=(None, *coords_unpadded_shape),
+                            dtype='float32',
+                            chunks=(1, *coords_unpadded_shape)
+                        )
+                    else:
+                        traj_dset = f[f'traj']
 
-                #     if 'scores' not in f:
-                #         score_dset = f.create_dataset(
-                #             "scores",
-                #             shape=(0, *atom_coords_unpadded_shape),
-                #             maxshape=(None, *atom_coords_unpadded_shape),
-                #             dtype='float32',
-                #             chunks=(1, *atom_coords_unpadded_shape)
-                #         )
-                #     else:
-                #         score_dset = f['scores']
+                    if f'u_bias' not in f:
+                        bias_dset = f.create_dataset(
+                            f'u_bias',
+                            shape=(0,),
+                            maxshape=(None,),
+                            dtype='float32',
+                            chunks=(1,)
+                        )
+                    else:
+                        bias_dset = f[f'u_bias']
 
-                #     # Unpad, write the score + coordinates and update.
-                #     coords_unpadded = atom_coords_next[:, atom_mask[0].bool(), :]
-                #     coords_np = coords_unpadded.cpu().numpy()
-                #     traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
-                #     traj_dset[-1, :, :, :] = coords_np
+                    # Write the umbrella bias + coordinates and update.
+                    coords_np = coords_nm_unpadded.detach().cpu().numpy() * 10 # Convert to angstroms.
+                    traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
+                    traj_dset[-1, :, :] = coords_np
+
+                    u_umb = u_umb.item()  # or: float(u_umb)
+                    bias_dset.resize(bias_dset.shape[0] + 1, axis=0)
+                    bias_dset[-1] = u_umb
 
                 integrator.step(1)
-
-                
-
-
 
     def calc_likelihoods_ips(
         self,
