@@ -2,9 +2,14 @@ import mdtraj as md
 import torch
 import numpy as np
 import torch.nn.functional as F
+import re
 
 from boltz.data import const
 
+def _get_resnum(atom_name: str) -> int:
+    """Helper function to extract residue ID from a full atom name."""
+    match = re.search(r'(\d+)', atom_name)
+    return int(match.group(1))
 
 def pdb_to_boltz_coords(
     pdb_file: str,
@@ -13,7 +18,8 @@ def pdb_to_boltz_coords(
     device: str
 ):
     """Processes an input PDB file into its corresponding internal Boltz
-    coordinate representation.
+    coordinate representation, as well as the corresponding element 
+    symbols and masses (used for OpenMM system construction).
     
     Also performs a handful of sanity checks for the conversion.
 
@@ -39,6 +45,12 @@ def pdb_to_boltz_coords(
     pdb_coords : torch.tensor of shape (n_padded_atoms, 3)
         Properly ordered and padded coordinates of provided PDB in 
         angstroms.
+
+    elements : list
+        A list of element names of pdb_coords' atoms.
+
+    masses : list
+        A list of masses (in daltons) of pdb_coords' atoms.
     """
     ref_atoms = const.ref_atoms
     has_ace = False
@@ -93,16 +105,24 @@ def pdb_to_boltz_coords(
     canonical internal ordering to fetch PDB atom coordinates in the 
     proper order.'''
     coord_list = []
-    n_atoms = len(pdb.xyz[0])
+    elements = []
+    masses = []
 
     atom_coords = {
-        str(list(pdb.topology.atoms)[i]): pdb.xyz[0][i] 
-        for i in range(n_atoms)
-    } # Keys: eg. 'ACE1-H1'. Values: eg. [0.2, 0.3, 0.1]
+        str(list(pdb.topology.atoms)[i]): (
+            pdb.xyz[0][i],
+            atom.element.symbol,
+            atom.element.mass
+        )
+        for i, atom in enumerate(pdb.topology.atoms)
+
+    } # Keys: eg. 'ACE1-CA'. 
+    # Values: eg. ([0.2, 0.3, 0.1], 'C', 12.0)
+    # Note: residue indices might not start on 1.
 
     # For PDB proteins, the chain might not start on residue 1.
     first_atom = str(list(pdb.topology.atoms)[0]) # eg. LYS1-N
-    first_res_idx = int(first_atom[3])
+    first_res_idx = _get_resnum(first_atom)
 
     start = first_res_idx + 1 if has_ace else first_res_idx
 
@@ -111,12 +131,14 @@ def pdb_to_boltz_coords(
         for atom in boltz_atom_ordering:
             atom_fullname = f'{res}{i}-{atom}'
             try:
-                coord_list.append(atom_coords[atom_fullname])
-            except:
+                coord_list.append(atom_coords[atom_fullname][0])
+                elements.append(atom_coords[atom_fullname][1])
+                masses.append(atom_coords[atom_fullname][2])
+            except Exception as e:
                 raise Exception(
-                    f'A Boltz canonical atom {str(atom)} is '
-                    f'missing in PDB {pdb_file}, residue {res}{i}.'
-                )
+                    f"A Boltz canonical atom {atom} is missing in PDB {pdb_file}, "
+                    f"residue {res}{i}."
+                ) from e
 
     # Finding the padding dimension for coord_tensor.
     padding_dim = atom_mask.shape[-1]
@@ -132,5 +154,5 @@ def pdb_to_boltz_coords(
     pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
     pdb_coords *= 10 # Converting to angstroms.
 
-    return pdb_coords
+    return pdb_coords, elements, masses
 
