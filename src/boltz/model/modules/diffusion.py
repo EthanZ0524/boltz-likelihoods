@@ -664,7 +664,7 @@ class AtomDiffusion(Module):
 
                 atom_coords = atom_coords_next
 
-            atom_coords = atom_coords.repeat_interlave(replicates, 0)
+            atom_coords = atom_coords.repeat_interleave(replicates, 0)
 
         # atom_coords : torch.tensor of shape (n_init_structs * replicates, n_padded_atoms, 3) 
         # (n_init_structs is either multiplicity or n_pdbs)
