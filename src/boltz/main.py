@@ -927,6 +927,12 @@ def cli() -> None:
     help="Whether to use the Importance Sampling (IS) likelihood estimation."
 )
 @click.option(
+    "--num_mc_samples",
+    type=int,
+    default=1000,    
+    help="How many Monte Carlo samples to use for the IS likelihood estimation. Default is 1000."
+)
+@click.option(
     "--umbrella_steps",
     type=int,
     default=100000,
@@ -943,12 +949,30 @@ def cli() -> None:
 )
 @click.option(
     "--umbrella_functor",
-    type=click.Path(exists=True),
+    type=str,
     help=(
-        "The path to the .py file which contains the functor class to compute "
-        "CVs for the given umbrella sampling system."
+        "The name of the functor class defined in "
+        "src/boltz/lutils/cvs.py used to compute CVs for the given "
+        "umbrella sampling system."
     ),
     default=None
+)
+@click.option(
+    "--umbrella_top",
+    type=click.Path(exists=True),
+    help=(
+        "A path to the PDB file to use as the topology for the "
+        "'Boltz-ified' umbrella sampling systems."
+    ),
+    default=None
+)
+@click.option(
+    "--umbrella_temp",
+    type=float,
+    help=(
+        "Model's implicit 'temperature' for umbrella simulations."
+    ),
+    default=50.
 )
 @click.option(
     "--write_full_pae",
@@ -1120,9 +1144,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     hutchinson_samples: int = 1,
     ode_batch_size: int = 1,
     ips_likelihood: bool = False,
+    num_mc_samples: int = 1000,
     umbrella_steps: int = 100000,
     umbrella_json: str = None,
     umbrella_functor: str = None,
+    umbrella_top: str = None,
+    umbrella_temp: int = 50,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1467,10 +1494,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         likelihood_args['hutchinson_samples'] = hutchinson_samples
         likelihood_args['ode_batch_size'] = ode_batch_size
         likelihood_args['ips_likelihood'] = ips_likelihood
+        likelihood_args['num_mc_samples'] = num_mc_samples
         model_module.likelihood_args = likelihood_args
 
         model_module.outdir = out_dir
-        model_module.head_init = str(head_init)
+        if head_init is not None:
+            model_module.head_init = str(head_init)
         model_module.save_conditioning_args = save_conditioning_args
         model_module.mode = mode
 
@@ -1495,7 +1524,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     else:
                         feats_fixed[k] = v
                 feats = feats_fixed
-                with torch.set_grad_enabled(True):
+
+                set_grad_enabled = ((mode == 'likelihood' or mode == 'umbrella') and not ips_likelihood)
+                print("Grad enabled:", set_grad_enabled)
+                with torch.set_grad_enabled(set_grad_enabled):
                     if mode == 'likelihood':
                         model_module.likelihood(feats, recycling_steps)
                     else:
@@ -1505,7 +1537,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                             recycling_steps, 
                             umbrella_steps,
                             umbrella_json,
-                            umbrella_functor
+                            umbrella_functor,
+                            umbrella_top,
+                            umbrella_temp, 
+                            out_dir / "umbrella",
                         )
 
     # Check if affinity predictions are needed

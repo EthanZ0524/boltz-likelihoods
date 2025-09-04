@@ -42,6 +42,7 @@ from boltz.lutils.cvs import CLASS_REGISTRY
 from openmm.app import *
 from openmm import *
 import openmm.unit as unit
+import mdtraj as md
 
 from torchdiffeq import odeint
 import torchode as to
@@ -583,9 +584,9 @@ class AtomDiffusion(Module):
 
         Notes
         -----
-        Unlike all other outputs which are written to disk by the
-        prediction writer post-inference, Langevin trajectories are
-        saved on the fly to prevent having to keep large trajectory 
+        Unlike structure prediction outputs which are written to disk 
+        by the prediction writer post-inference, Langevin trajectories 
+        are saved on the fly to prevent having to keep large trajectory 
         tensors in memory.
         """
         sigmas = self.sample_schedule(diffusion_sampling_steps)
@@ -664,7 +665,7 @@ class AtomDiffusion(Module):
 
                 atom_coords = atom_coords_next
 
-            atom_coords = atom_coords.repeat_interlave(replicates, 0)
+            atom_coords = atom_coords.repeat_interleave(replicates, 0)
 
         # atom_coords : torch.tensor of shape (n_init_structs * replicates, n_padded_atoms, 3) 
         # (n_init_structs is either multiplicity or n_pdbs)
@@ -1314,19 +1315,66 @@ class AtomDiffusion(Module):
         umbrella_steps,
         param_dict,
         umbrella_functor,
+        umbrella_top, 
+        umbrella_temp,
         diffusion_stop,
+        atom_mask,
+        masses,
+        elements,
+        outdir,
         **network_condition_kwargs
     ):  
+        """Runs umbrella sampling simulations and saves trajectories + 
+        umbrella pulling energies.
+
+        Parameters
+        ----------
+        coord_sets : torch.tensor of shape (n_windows, n_padded_atoms, 3)
+            The (padded) starting coordinates in angstroms for each of 
+            the umbrella windows' simulations.
+
+        umbrella_steps : int
+            The number of simulation steps to run for each umbrella 
+            indow.
+
+        param_dict : dict
+            Keys are filepaths to PDBs of umbrella sampling window
+            simulations' starting conformations. Values are dicts - 
+            subdict has keys 'k' and 'cv0' with values being the
+            umbrella bias strength (float) and the 2-vector (list) 
+            representing the window center in tICA CV space, 
+            respectively.
+
+        umbrella_functor : str
+            The name of the appropriate functor defined in 
+            src/boltz/lutils/cvs.py used to calcualte CV values for the
+            umbrella-sampled protein. 
         
+        diffusion_stop : int
+            The noise level to use for the score (simulation forces).
+
+        atom_mask : torch.tensor of shape (1, n_padded_atoms)
+            Used to unpad coordinates.
+
+        outdir : pathlib.Path
+            A path to the directory to write results to.
+        """
+        outdir = outdir.expanduser().resolve(strict=False)
+        outdir.mkdir(parents=True, exist_ok=True)
+
         # Setting up CV functor.
         if umbrella_functor not in CLASS_REGISTRY:
             raise ValueError(
                 f"Unknown class '{umbrella_functor}'. "
                 f"Available: {list(CLASS_REGISTRY)}"
             )
-        
+                
+        # Creating Boltz-ified topology for functor.
+        # Hacky temporary solution: use a Boltz-predicted structure 
+        # as the topology. TODO: make this more robust.
+        top = md.load(umbrella_top).topology
         functor_class = CLASS_REGISTRY[umbrella_functor]
-        calc_cv = functor_class()
+        calc_cv = functor_class(top, device=self.device)
 
         sigmas = self.sample_schedule(200)
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
@@ -1336,27 +1384,31 @@ class AtomDiffusion(Module):
         t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
 
         # Running umbrella window for each pre-defined window.
-        for (coords, pdb_file, pdb_dict) in tqdm(
-            zip(coord_sets, param_dict.items()),
+        for sim_idx, (init_coords, (pdb_file, pdb_dict)) in tqdm(
+            enumerate(zip(coord_sets, param_dict.items())),
+            total=len(coord_sets),
             desc='Doing umbrella sampling for windows',
-            mininterval=100
+            position=0
         ):
-            # Setting up OMM system.
-            pdb = PDBFile(pdb_file)
-            forcefield = ForceField("amber14-all.xml")  # Arbitrary ff. 
-            system = forcefield.createSystem(
-                pdb.topology,
-                nonbondedMethod=NoCutoff,
-                constraints=None
-            )
-            n_atoms = system.getNumParticles()
+            # Check if the trajectory already exists.
+            if (outdir / f'umbrella_{sim_idx}.hdf5').exists():
+                with h5py.File(str(outdir / f'umbrella_{sim_idx}.hdf5'), "r") as f:
+                    if len(f['traj']) < 5000:
+                        # Remove + restart trajectory if it wasn't finished.
+                        (outdir / f'umbrella_{sim_idx}.hdf5').unlink()
+                    else:
+                        continue # Skip current traj if it was finished.
 
-            # Removing all forces - we only use custom forces.
-            while system.getNumForces() > 0:
-                system.removeForce(0)
+            # Setting up OMM system.
+            pdb = PDBFile(umbrella_top)
+            system = System()
+            for atom in pdb.topology.atoms():
+                system.addParticle(atom.element.mass)
+
+            n_atoms = system.getNumParticles()
             
             # Setting up umbrella force. 
-            umbrella_force = CustomExternalForce("fx*x + fy*y + fz*z")
+            umbrella_force = CustomExternalForce("-fx*x - fy*y - fz*z")
             umbrella_force.addPerParticleParameter("fx")
             umbrella_force.addPerParticleParameter("fy")
             umbrella_force.addPerParticleParameter("fz")
@@ -1374,32 +1426,54 @@ class AtomDiffusion(Module):
             system.addForce(nn_force)
 
             # Setting up integrator and context.
-            dt = 0.002 * unit.picoseconds
-            temperature = 300 * unit.kelvin
+            dt = 0.001 * unit.picoseconds
+            temperature = umbrella_temp * unit.kelvin
             friction = 1.0 / unit.picosecond
 
-            integrator = LangevinIntegrator(temperature, friction, dt)
-            platform = Platform.getPlatformByName("GPU")
+            integrator = LangevinMiddleIntegrator(temperature, friction, dt)
+            platform = Platform.getPlatformByName("OpenCL")
             context = Context(system, integrator, platform)
-            init_positions = coords
+
+            # Unpadding coordinates + sanity checking dimensions.
+            init_coords_unpadded = init_coords[atom_mask.squeeze(0).bool(), :]
+            init_positions = init_coords_unpadded.detach().cpu().numpy() / 10 # Convert to nm for OpenMM.
+
+            if len(init_positions) != n_atoms:
+                raise ValueError(
+                    f"The provided umbrella_top file's number of atoms "
+                    f"({n_atoms}) is not equal to the number "
+                    f"of atoms of the internal Boltz representation "
+                    f"({len(init_positions)})"
+                )
             context.setPositions(init_positions)
 
-            for steps in tqdm(
+            for _ in tqdm(
                 range(umbrella_steps),
                 desc='Running trajectory for a window',
-                mininterval=30
+                mininterval=30,
+                position=1, 
+                leave=False
             ):
                 # Get positions from OpenMM.
                 state = context.getState(getPositions=True)
-                coords_nm = torch.tensor(
+                coords_nm_unpadded = torch.tensor(
                     state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
                     dtype=torch.float32
-                )
+                ).to(self.device) # (n_atoms, 3)
+
+                # Re-padding to match shape with conditioning tensors.
+                padding_dim = atom_mask.shape[-1]
+                rows_to_pad = padding_dim - coords_nm_unpadded.shape[0]
+                coords_nm_padded = F.pad(coords_nm_unpadded, pad=(0, 0, 0, rows_to_pad))
+
+                # Centering + unsqueezing coordinates for score model.
+                coords_nm_padded = coords_nm_padded - coords_nm_padded.mean(dim=0, keepdim=True)
+                coords_nm_padded = coords_nm_padded.unsqueeze(0)
 
                 # Computing score module 'force' and adding them to system. 
                 atom_coords_denoised, _ = \
                     self.preconditioned_network_forward(
-                        coords_nm * 10, # Converting to angstroms for Boltz.
+                        coords_nm_padded * 10, # Converting to angstroms for Boltz.
                         t_hat,
                         training=False,
                         network_condition_kwargs=dict(
@@ -1409,10 +1483,17 @@ class AtomDiffusion(Module):
                         ),
                     )
 
-                f_nn = (atom_coords_denoised - (coords_nm * 10)) / (t_hat ** 2) # Using the score as the force.
+                # No need to unpad score module output.
+                f_nn = ((atom_coords_denoised - (coords_nm_padded * 10)) / (t_hat ** 2)).squeeze(0)
+
+                # Score is in units of inverse angstroms. Converting to inverse nm.
+                f_nn = f_nn * 10 / unit.nanometer
+                f_nn = f_nn * (unit.BOLTZMANN_CONSTANT_kB * unit.AVOGADRO_CONSTANT_NA).in_units_of(unit.kilojoule_per_mole / unit.kelvin)
+                f_nn = f_nn * umbrella_temp * unit.kelvin
+                force_unit = f_nn.unit
 
                 for i in range(n_atoms):
-                    nn_force.setParticleParameters(i, i, f_nn[i].tolist())
+                    nn_force.setParticleParameters(i, i, f_nn[i].tolist() * force_unit)
                 nn_force.updateParametersInContext(context)
 
                 '''
@@ -1425,27 +1506,64 @@ class AtomDiffusion(Module):
 
                 Then, we need dCV/dR, which we compute using torch grad.
                 '''
-                cv0 = np.array(pdb_dict['cv0'])
+                cv0 = torch.tensor(pdb_dict['cv0']).to(self.device)
                 k_umb = pdb_dict['k']
 
-                coords_nm.requires_grad_()
-                cv = calc_cv(coords_nm)
+                coords_nm_unpadded = coords_nm_unpadded.squeeze(0) # (n_atoms, 3)
+                coords_nm_unpadded.requires_grad_()
+                cv = calc_cv(coords_nm_unpadded)
                 diff = cv - cv0
                 u_umb = 0.5 * k_umb * torch.sum(diff ** 2)
-                f_umb = torch.autograd.grad(u_umb, coords_nm, create_graph=True)[0]
+                f_umb = -torch.autograd.grad(u_umb, coords_nm_unpadded, create_graph=True)[0] # Negative gradient of umbrella potential.
 
                 for i in range(n_atoms):
-                    umbrella_force.setParticleParameters(i, i, f_umb[i].tolist())
+                    umbrella_force.setParticleParameters(i, i, f_umb[i].tolist() * force_unit)
                 umbrella_force.updateParametersInContext(context)
 
+                # Writing coordinate + CV energy data.
+                # Saving coordinates in units of angstroms.
+                coords_unpadded_shape = coords_nm_unpadded.squeeze(0).shape
+                with h5py.File(str(outdir / f'umbrella_{sim_idx}.hdf5'), "a") as f:
+                    if f'traj' not in f:
+                        traj_dset = f.create_dataset(
+                            f"traj",
+                            shape=(0, *coords_unpadded_shape),
+                            maxshape=(None, *coords_unpadded_shape),
+                            dtype='float32',
+                            chunks=(1, *coords_unpadded_shape)
+                        )
+                    else:
+                        traj_dset = f[f'traj']
+
+                    if f'u_bias' not in f:
+                        bias_dset = f.create_dataset(
+                            f'u_bias',
+                            shape=(0,),
+                            maxshape=(None,),
+                            dtype='float32',
+                            chunks=(1,)
+                        )
+                    else:
+                        bias_dset = f[f'u_bias']
+
+                    # Write the umbrella bias + coordinates and update.
+                    coords_np = coords_nm_unpadded.detach().cpu().numpy() * 10 # Convert to angstroms.
+                    traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
+                    traj_dset[-1, :, :] = coords_np
+
+                    u_umb = u_umb.item()  # or: float(u_umb)
+                    bias_dset.resize(bias_dset.shape[0] + 1, axis=0)
+                    bias_dset[-1] = u_umb
+
                 integrator.step(1)
+
     def calc_likelihoods_ips(
         self,
         input_coords=None,
         likelihood_args=None,
         **network_condition_kwargs,
     ):
-        """Does mcmc likelihood calculation using Importance Path Sampling
+        """Does monte carlo likelihood calculation using Importance Path Sampling
         
         Parameters
         ----------
@@ -1479,38 +1597,52 @@ class AtomDiffusion(Module):
         -----
         calc_likelihoods' sigma_min and sigma_max values are those of
         the default diffusion rollout's (ie. hardcoded, see line below).
+
+        Effective sample size (ESS) is computed as 
+        ESS = (sum w_i)^2 / sum(w_i^2), where w_i are the importance weights 
+        in non-log space; this quantifies the number of independent samples 
+        contributing to the estimate after weighting.
         """
         num_sampling_steps = self.num_sampling_steps # 200 by default.
         num_mc_samples = likelihood_args.get('num_mc_samples', 1000)
         sigmas = self.sample_schedule(num_sampling_steps) # goes from T_max to 0.
+        print("sigmas shape:", sigmas.shape)
         results = {}
+
+        outdir = likelihood_args['outdir'].expanduser().resolve(strict=False)
+        # save the state dict of network_condition_kwargs
+        torch.save(network_condition_kwargs, outdir / "network_condition_kwargs.pth")
+        # save the input coords
+        torch.save(input_coords, outdir / "input_coords.pth")
 
         def _score_fn_batch_reshaped(coords, sigma): 
             # takes in the coords of shape (batch, n_padded_atoms * 3),
             # reshapes it to (batch, n_padded_atoms, 3) and computes the score.
             # and then returns the score in shape (batch, n_padded_atoms * 3)
+            # coords are now already on GPU
             batch_size, data_dim = coords.shape
-            coords = coords.view(batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
+            coords_gpu = coords.view(batch_size, -1, 3)  # Reshape to (batch_size, n_padded_atoms, 3)
             # center the coordinates to origin
-            coords = coords - coords.mean(dim=1, keepdim=True)
+            coords_gpu = coords_gpu - coords_gpu.mean(dim=1, keepdim=True)
             denoised, _ = self.preconditioned_network_forward(
-                coords,  # add batch dimension
+                coords_gpu,  # add batch dimension
                 sigma.item(),
                 training=False,
                 network_condition_kwargs=dict(
-                    multiplicity=1,
+                    multiplicity=batch_size,  # Changed from 1 to batch_size
                     model_cache={},
                     **network_condition_kwargs,
                 ),
             )
-            score = ((denoised - coords) / (sigma ** 2)) # (batch_size, n_padded_atoms, 3)
+            score = ((denoised - coords_gpu) / (sigma ** 2)) # (batch_size, n_padded_atoms, 3)
             score = score.view(batch_size, -1)  # Reshape back to (batch_size, n_padded_atoms * 3)
-            return score
+            return score  # Keep on GPU
         
         def forward_path_em(starting_coords, timepoints):
             """
             Evolve the sample in forward time using the Euler-Maruyama discretization.
             Also collects the path weights for importance sampling.
+            Trajectory is kept on GPU for faster computation.
 
             Parameters
             ----------
@@ -1524,38 +1656,45 @@ class AtomDiffusion(Module):
             Returns
             -------
             coords_path : torch.tensor of shape (len(timepoints), batch, n_padded_atoms * 3)
-                Path of coordinates at each time step.
+                Path of coordinates at each time step (on GPU).
             log_path_weights : torch.tensor of shape (batch,)
-                Logarithm of the path weights for importance sampling.
+                Logarithm of the path weights for importance sampling (on GPU).
             """
             batch_size, data_dim = starting_coords.shape # should be n_padded_atoms * 3
-            coords_path = starting_coords.new_zeros(
+            # Keep trajectory on GPU for faster computation
+            starting_coords_gpu = starting_coords.to(self.device)
+            coords_path = starting_coords_gpu.new_zeros(
                 (len(timepoints), batch_size, data_dim)
             )
-            coords_path[0] = starting_coords
-            log_path_weights = starting_coords.new_zeros((batch_size), dtype=torch.float32)
-            for i in range(len(timepoints) - 1):
+            coords_path[0] = starting_coords_gpu
+            log_path_weights = starting_coords_gpu.new_zeros((batch_size), dtype=torch.float32)
+            for i in range(len(timepoints)-1):
                 coords = coords_path[i]
                 sigma = timepoints[i]
+
                 next_sigma = timepoints[i + 1]
                 delta_t = next_sigma - sigma
                 dW = torch.randn_like(coords_path[0]) * torch.sqrt(delta_t)
                 # Karras uses f = 0, g(t) = sqrt(2t) 
                 # noising kernel is then dX_t = sqrt(2t) * dW_t so X_{t+dt} ~ N(X_t, 2t * dt I)
-
-                new_coords = coords + (2 * sigma).sqrt() * dW
+                if not (torch.isclose(sigma, torch.zeros_like(sigma)) or torch.isclose(delta_t, torch.zeros_like(sigma))) :
+                    new_coords = coords + torch.sqrt(2 * sigma) * dW
+                    log_path_weights -= (1 / (4 * delta_t * sigma)) * torch.norm(coords - new_coords, dim=-1)**2  # quadratic term
+                else:
+                    new_coords = coords.clone()
                 coords_path[i + 1] = new_coords
-                log_path_weights -= (1 / (4 * delta_t * sigma)) * torch.norm(coords - new_coords, dim=-1)**2  # quadratic term
+
             return coords_path, log_path_weights
         
         def log_path_measure_reverse_time(forward_trajectory, timesteps, score_model):
             """
             Calculate path measure under reverse-time dynamics
+            Trajectory is on GPU for faster computation.
             
             Parameters
             ----------
             forward_trajectory : torch.tensor of shape (num_timesteps, batch, n_padded_atoms * 3)
-                Trajectory in forward time.
+                Trajectory in forward time (on GPU).
             
             timesteps : list of floats
 
@@ -1565,23 +1704,24 @@ class AtomDiffusion(Module):
                 Function that computes the score(x,t) at given coordinates and time.
 
             Returns
-            -------
+            log_p = torch.zeros(forward_trajectory.shape[1], dtype=forward_trajectory.dtype, device=self.device)
             log_p : torch.tensor of shape (batch,)
-                Logarithm of the path measure under reverse-time dynamics.
+                Logarithm of the path measure under reverse-time dynamics (on GPU).
             """
-            log_p = torch.zeros(forward_trajectory.shape[-1], dtype=torch.float32)
-            
+            log_p = torch.zeros(forward_trajectory.shape[1], dtype=torch.float32, device=self.device)
+
             # Iterate backwards through the forward trajectory
             for i in range(len(timesteps) - 1):
                 t = timesteps[-(i+1)]  # Current time (going backwards)
                 delta_t = timesteps[-(i+1)] - timesteps[-(i+2)]  # Keep positive dt
 
                 # States: current (later in forward time) and next (earlier in forward time)
-                curr_x = forward_trajectory[-(i+1), :, :]
-                next_x = forward_trajectory[-(i+2), :, :] if i < len(timesteps) - 2 else forward_trajectory[0, :, :]
+                curr_x = forward_trajectory[-(i+1), :, :]  # On GPU
+                next_x = forward_trajectory[-(i+2), :, :] if i < len(timesteps) - 2 else forward_trajectory[0, :, :]  # On GPU
                 
                 # Reverse-time drift: f - g²s
-                score = score_model(curr_x, t)
+                # score_model now works with GPU tensors
+                score = score_model(curr_x, t)  # Returns result on GPU
                 diffusion_sq = 2 * t
                 reverse_drift = - (diffusion_sq * score)
                 
@@ -1608,11 +1748,10 @@ class AtomDiffusion(Module):
             
             sigma_min, sigma_max = sigmas[-2], sigmas[0] # Last sigma is 0.
             t = struct.new_tensor([sigma_min, sigma_max])
-            x_min = struct.view(1, -1)  # Reshape to (1, n_padded_atoms * 3)
+            x_min = struct.view(1, -1).to(self.device)  # Reshape to (1, n_padded_atoms * 3) and move to GPU
             x_min = x_min.repeat(num_mc_samples, 1)  # Repeat for number of MC samples
 
-            ascending_time = torch.flip(sigmas.clone(), dims=[0])  # Reverse order for forward path (ascending time)
-
+            ascending_time = torch.flip(sigmas.clone(), dims=[0])  # Keep time on same device as sigmas
             x_path, log_path_weights_fwd = forward_path_em(
                 x_min,
                 ascending_time
@@ -1624,15 +1763,30 @@ class AtomDiffusion(Module):
                 _score_fn_batch_reshaped
             )
 
-            latent = x_path[-1]  # Last step in the forward path
+            latent = x_path[-1]  # Last step in the forward path (on GPU)
 
-            ll_prior = torch.distributions.Normal(0, sigma_max).log_prob(latent.flatten()).sum()
+            # ll_prior = torch.distributions.Normal(0, sigma_max.cpu()).log_prob(latent.flatten()).sum()
+            ll_prior = torch.distributions.MultivariateNormal(torch.zeros(latent.shape[-1], device=self.device), sigma_max**2 * torch.eye(latent.shape[-1], device=self.device)).log_prob(latent)
 
             # take the average in non-log space
-            log_likelihoods = log_path_weights_fwd + log_path_weights_rev + ll_prior.item()
+            # All tensors are on GPU now
+            log_likelihoods = log_path_weights_rev + ll_prior - log_path_weights_fwd
             log_mean_likelihood = torch.logsumexp(log_likelihoods, dim=0) - torch.log(torch.tensor(num_mc_samples, dtype=torch.float32, device=self.device))
 
-            results[pdb_name] = log_mean_likelihood.item()
+            # normalized_log_weights = log_likelihoods - torch.logsumexp(log_likelihoods, dim=0)  # Normalize log weights
+            # log_effective_sample_size = -torch.logsumexp(2 * normalized_log_weights, dim=0)  # log(1/sum(w_i^2)) = -logsumexp(2 log(w_i))
+
+            log_weights_shifted = log_likelihoods - log_likelihoods.max()  # For numerical stability
+
+            # ESS = (sum w_i)^2 / sum(w_i^2)
+            log_sum_weights = torch.logsumexp(log_weights_shifted, dim=0)  # log(sum w_i)
+            log_sum_weights_squared = torch.logsumexp(2 * log_weights_shifted, dim=0)  # log(sum w_i^2)
+
+            log_ess = 2 * log_sum_weights - log_sum_weights_squared
+
+            results[pdb_name] = {"logp": log_mean_likelihood.item(),
+                                 "effective_sample_size": log_ess.exp().item(),
+                                 "num_mc_samples": num_mc_samples}
             endtime = time.time()
             runtimes.append(endtime - start_time)
             print(f'{pdb_name} took  {endtime - start_time:.2f} seconds')
