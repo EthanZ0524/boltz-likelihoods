@@ -45,6 +45,7 @@ from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
 from boltz.lutils.pdb_processing import pdb_to_boltz_coords
+from sim import run_cg_sim
 
 class Boltz1(LightningModule):
     """Boltz1 model."""
@@ -587,7 +588,6 @@ class Boltz1(LightningModule):
             )
             coord_list.append(coords)
         coord_sets = torch.stack(coord_list, axis=0)
-    
         self.structure_module.run_umbrella(
             coord_sets=coord_sets,
             umbrella_steps=umbrella_steps,
@@ -606,7 +606,145 @@ class Boltz1(LightningModule):
             feats=feats,
             relative_position_encoding=relative_position_encoding,
         )
-            
+
+    def umbrellav2(
+        self,
+        feats,
+        diffusion_stop,
+        recycling_steps,
+        starting_positions_pdb_path,
+    ):
+        """Outer wrapper of umbrella sampling calculations.
+
+        Checks head_init inputs - if no Pairformer outputs are provided, 
+        runs the Pairformer. Checks if the required umbrella.json is 
+        provided and processes it if it does (throws an error if not). 
+
+        Parameters
+        ----------
+        umbrella_steps : int
+            Number of simulation steps to run per umbrella window.
+
+        umbrella_json : str
+            Path to 
+
+        umbrella_temp : float
+        """
+        # Retrieving score module conditioning tensors.
+        atom_mask = feats["atom_pad_mask"]
+    
+        chains = feats["record"][0].chains
+        sequences = [chain.sequence for chain in chains]
+        tensor_dict = None
+        if self.head_init:
+        #     tensor_dict, _, _ = self._load_head_init(sequences, feats["atom_pad_mask"]) #TODO: where is the pdistogram??
+            # for now, just manually load these without pdistogram
+            root = Path(self.head_init)
+            if (root / 'tensors.hdf5').exists():
+                with h5py.File(root / "tensors.hdf5", 'r') as f:
+                    s = torch.from_numpy(f['s_trunk'][:]).to(self.device)
+                    z = torch.from_numpy(f['z_trunk'][:]).to(self.device)
+                    s_inputs = torch.from_numpy(f['s_inputs'][:]).to(self.device)
+                    relative_position_encoding = torch.from_numpy(f['rpes'][:]).to(self.device)
+            print(f"Loaded conditioning tensors from {root / 'tensors.hdf5'}", flush=True)
+            tensor_dict = {
+                's': s,
+                'z': z,
+                's_inputs': s_inputs,
+                'relative_position_encoding': relative_position_encoding
+            }
+        
+        if tensor_dict is None: # Run Pairformer if not pre-computed.
+            tensor_dict, _ = self._run_pairformer(
+                feats,
+                recycling_steps
+            )
+            conddir = (self.outdir / "condition").expanduser().resolve(strict=False)
+            conddir.mkdir(parents=True, exist_ok=True)
+            with h5py.File(conddir / "tensors.hdf5", 'w') as f:
+                f.create_dataset('s_trunk', data=tensor_dict['s'].cpu().detach().numpy())
+                f.create_dataset('z_trunk', data=tensor_dict['z'].cpu().detach().numpy())
+                f.create_dataset('s_inputs', data=tensor_dict['s_inputs'].cpu().detach().numpy())
+                f.create_dataset('rpes', data=tensor_dict['relative_position_encoding'].cpu().detach().numpy())
+                # f.create_dataset('pdistogram', data=tensor_dict['pdistogram'].cpu().detach().numpy())
+            print(f"Saved conditioning tensors to {conddir / 'tensors.hdf5'}", flush=True)
+
+        s = tensor_dict['s']
+        z = tensor_dict['z']
+        s_inputs = tensor_dict['s_inputs']
+        relative_position_encoding = tensor_dict['relative_position_encoding']
+        
+        # Retrieving umbrella simulation input coordinates.
+        # with open(umbrella_json, 'r') as file:
+        #     param_dict = json.load(file)
+
+        coord_list = []        
+
+        n_starting_pos = md.load(starting_positions_pdb_path).n_frames
+        for frame_index in range(n_starting_pos):
+            coords, elements, masses = pdb_to_boltz_coords(
+                pdb_file=starting_positions_pdb_path,
+                yaml_seq=sequences[0],
+                atom_mask=atom_mask,
+                device=self.device,
+                apply_padding=False, # we'll take care of this during get_force()
+                frame_index=frame_index
+            )
+            coord_list.append(coords)
+        coord_sets = torch.stack(coord_list, axis=0)
+    
+
+        sigmas = self.structure_module.sample_schedule(200)
+        gammas = torch.where(sigmas > self.structure_module.gamma_min, self.structure_module.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
+        sigma_tm, _, gamma = sigmas_and_gammas[diffusion_stop]
+        t_hat = sigma_tm * (1 + gamma) # Constant noise level for score calcs.
+        print(f"{t_hat = }, {t_hat.shape = }", flush=True)
+        
+        # Expand conditioning tensors and feats to match batch size of coordinate sets
+        batch_size = coord_sets.shape[0]  # 100 coordinate sets
+        
+        # Expand conditioning tensors
+        s_expanded = s.repeat(batch_size, 1, 1)
+        z_expanded = z.repeat(batch_size, 1, 1, 1) 
+        s_inputs_expanded = s_inputs.repeat(batch_size, 1, 1)
+        relative_position_encoding_expanded = relative_position_encoding.repeat(batch_size, 1, 1, 1)
+        
+        # Expand feats to match batch size
+        feats_expanded = {}
+        for key, value in feats.items():
+            if isinstance(value, torch.Tensor):
+                feats_expanded[key] = value.repeat(batch_size, *([1] * (value.dim() - 1)))
+            else:
+                feats_expanded[key] = value  # Non-tensor values don't need expansion
+        
+        network_condition_kwargs = {
+            "multiplicity":1,
+            "model_cache":{},
+            "s_trunk":s_expanded,
+            "z_trunk":z_expanded,
+            "s_inputs":s_inputs_expanded, # Pre-trunk token-level sequence.
+            "feats":feats_expanded,
+            "relative_position_encoding":relative_position_encoding_expanded,
+        }
+        
+
+        self.structure_module.set_force_parameters(
+            batch_size=batch_size, 
+            atom_mask=atom_mask,
+            t_hat=float(t_hat), 
+            temperature=300.0, 
+            bias_potential_path="/global/cfs/cdirs/m4235/boltz_files/bba/bias_force_bba.pt", 
+            **network_condition_kwargs
+        )
+        
+        print("Running Umbrella Simulation", flush=True)
+        run_cg_sim(u_model=self.structure_module, 
+                   start_positions=coord_sets,
+                   masses=masses,
+                   cfg="/global/homes/d/dunne/boltz-likelihoods/src/sim/run_cg_sim.yaml")
+
+
     def forward(
         self,
         feats: dict[str, Tensor],

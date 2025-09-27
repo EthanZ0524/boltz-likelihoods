@@ -845,7 +845,7 @@ def cli() -> None:
         "Whether to save score network conditioning tensors (used by "
         "head_init)."
     ),
-    default=None
+    default=True
 )
 @click.option(
     "--diffusion_samples",
@@ -1477,15 +1477,15 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     "calculation."
                 )
             
-        if mode == 'umbrella':
-            if umbrella_json is None:
-                raise ValueError(
-                    "--umbrella_json is required for umbrella sampling."
-                )
-            if umbrella_functor is None:
-                raise ValueError(
-                    "--umbrella_functor is required for umbrella sampling."
-                )
+        # if mode == 'umbrella':
+        #     if umbrella_json is None:
+        #         raise ValueError(
+        #             "--umbrella_json is required for umbrella sampling."
+        #         )
+        #     if umbrella_functor is None:
+        #         raise ValueError(
+        #             "--umbrella_functor is required for umbrella sampling."
+        #         )
             
         head_init = Path(head_init).expanduser().resolve() if head_init else None         
         likelihood_args = ode_args.copy()
@@ -1531,16 +1531,22 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                     if mode == 'likelihood':
                         model_module.likelihood(feats, recycling_steps)
                     else:
-                        model_module.umbrella(
-                            feats, 
-                            diffusion_stop,
-                            recycling_steps, 
-                            umbrella_steps,
-                            umbrella_json,
-                            umbrella_functor,
-                            umbrella_top,
-                            umbrella_temp, 
-                            out_dir / "umbrella",
+                        # model_module.umbrella(
+                        #     feats, 
+                        #     diffusion_stop,
+                        #     recycling_steps, 
+                        #     umbrella_steps,
+                        #     umbrella_json,
+                        #     umbrella_functor,
+                        #     umbrella_top,
+                        #     umbrella_temp, 
+                        #     out_dir / "umbrella",
+                        # )
+                        model_module.umbrellav2(
+                            feats=feats,
+                            diffusion_stop=diffusion_stop,
+                            recycling_steps=recycling_steps,
+                            starting_positions_pdb_path="/global/cfs/cdirs/m4235/boltz_files/bba/umbrella/all_bba_start_positions.pdb",
                         )
 
     # Check if affinity predictions are needed
