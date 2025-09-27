@@ -48,6 +48,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "pymbar>=4.0.3",
     "openmm>=8.3.1",
+    "omegaconf>=2.3.0",
 ]
 
 [project.scripts]
