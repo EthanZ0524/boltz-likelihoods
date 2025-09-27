@@ -15,7 +15,9 @@ def pdb_to_boltz_coords(
     pdb_file: str,
     yaml_seq: str,
     atom_mask: torch.tensor,
-    device: str
+    device: str,
+    apply_padding: bool = True,
+    frame_index: int = 0
 ):
     """Processes an input PDB file into its corresponding internal Boltz
     coordinate representation, as well as the corresponding element 
@@ -39,6 +41,15 @@ def pdb_to_boltz_coords(
         match atom_mask's dimensions to be properly shaped for Boltz.
 
     device : str
+
+    apply_padding : bool, optional
+        Whether to pad the coordinates to match atom_mask dimensions.
+        Default is True.
+
+    frame_index : int, optional
+        Index of the frame to use from the PDB file (0-based). If the
+        PDB contains multiple frames, this specifies which one to use.
+        Default is 0 (first frame).
 
     Returns
     -------
@@ -71,6 +82,15 @@ def pdb_to_boltz_coords(
     init_pdb = md.load(pdb_file)
     prot = init_pdb.topology.select("protein")
     pdb = init_pdb.atom_slice(prot)
+    
+    # Validate frame_index
+    if frame_index >= pdb.n_frames:
+        print(
+            f"Frame index {frame_index} is out of range for PDB {pdb_file} "
+            f"which has {pdb.n_frames} frames. Using frame 0 instead."
+        )
+        frame_index = 0
+
     pdb_seq = []
 
     for residue in pdb.topology.residues:
@@ -110,7 +130,7 @@ def pdb_to_boltz_coords(
 
     atom_coords = {
         str(list(pdb.topology.atoms)[i]): (
-            pdb.xyz[0][i],
+            pdb.xyz[frame_index][i],
             atom.element.symbol,
             atom.element.mass
         )
@@ -150,9 +170,12 @@ def pdb_to_boltz_coords(
             f'input conditioning tensors. Skipping.'
         )
         return None
-    coord_tensor = coord_tensor - coord_tensor.mean(dim=0, keepdim=True) # Centering to origin.
-    pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
+    if apply_padding:
+        pdb_coords = F.pad(coord_tensor, pad=(0, 0, 0, rows_to_pad))
+    else:
+        pdb_coords = coord_tensor
+    pdb_coords = pdb_coords - pdb_coords.mean(dim=0, keepdim=True) # Centering to origin.
     pdb_coords *= 10 # Converting to angstroms.
-
+    
     return pdb_coords, elements, masses
 
