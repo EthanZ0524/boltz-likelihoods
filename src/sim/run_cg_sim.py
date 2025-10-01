@@ -9,59 +9,24 @@ import random
 
 # @hydra.main(version_base="1.3", config_path="../cfgs", config_name="cg_sim")
 # def main(cfg):
-def run_cg_sim(u_model, start_positions, masses=None, cfg="cg_sim.yaml"):
+def run_cg_sim(u_model, start_positions, masses, cfg="cg_sim.yaml"):
     """
     u_model: nn.Module subclass that has a get_forces(positions) method. The bias force should be included in this model if desired.
-    topology: md.Trajectory.topology object that defines the system to be simulated.
     start_positions: np.ndarray of shape (batch_size, n_atoms, 3) defining the initial positions of the system.
+    cfg: str (path to YAML file) or dict (configuration dictionary)
     """
     batch_size = u_model.batch_size_force
-    cfg = OmegaConf.load(cfg)
-    global_args = cfg.global_args
-    topology = md.load(global_args["pdb_file"]).topology
-    # model_folder = global_args["model_folder"]
-    # if model_folder is None:
-    #     model_cfg = cfg
-    # else:
-    #     model_cfg = OmegaConf.load(f"{model_folder}/config.yaml")
     
-    # nn_config = model_cfg["nn"]
-    # prior_config = model_cfg["prior"]
-    # moe_config = model_cfg["moe"]
-    # train_config = model_cfg["train"]
-    # bias_force = global_args["bias_force"]
+    # Handle both YAML file path and configuration dictionary
+    if isinstance(cfg, str):
+        cfg = OmegaConf.load(cfg)
+    else:
+        # Convert dict to OmegaConf structure
+        cfg = OmegaConf.create(cfg)
+    print(cfg)
+    global_args = cfg.global_args
+    # topology = md.load(global_args["pdb_file"]).topology
 
-    # if not model_cfg.global_args.use_nn:
-    #     nn_model_name = None
-    #     nn_config = None
-    # else:
-    #     nn_model_name = nn_config["model"]
-    #     nn_model_args = nn_config["model_args"]
-    # if not model_cfg.global_args.use_prior:
-    #     prior_model_name = None
-    #     prior_config = None
-    # else:
-    #     prior_model_name = prior_config["model"]
-    #     prior_model_args = prior_config["model_args"]
-    # if not model_cfg.global_args.use_moe:
-    #     moe_model_name = None
-    #     moe_model_args = None
-    #     moe_config = None
-    # else:
-    #     moe_model_name = moe_config["model"]
-    #     moe_model_args = moe_config["model_args"]
-    # edge_args = model_cfg["dataset"]["edge_args"]
-
-    # u_model = CGSimModel(nn_model_name=nn_model_name, 
-    #                     nn_model_args=nn_model_args,
-    #                     prior_model_name=prior_model_name,
-    #                     prior_model_args=prior_model_args,
-    #                     moe_model_name=moe_model_name,
-    #                     moe_model_args=moe_model_args,
-    #                     bias_force=bias_force,
-    #                     **train_config["lightning_model_args"])
-    # if global_args["model_folder"] is not None:
-    #     u_model.load_model_from_ckpt(f"{model_folder}/checkpoints/best_model.ckpt")
     if torch.cuda.is_available():
         u_model = u_model.cuda()
 
@@ -74,12 +39,12 @@ def run_cg_sim(u_model, start_positions, masses=None, cfg="cg_sim.yaml"):
     # OmegaConf.save(cfg, f"{global_args['save_folder_name']}/config.yaml")
 
     # backbone = topology.select("name CA or name N or name C")
-    num_atoms = topology.n_atoms
-    print(f"Number of atoms to simulate: {num_atoms}", flush=True)
-    if masses is None:
-        masses = []
-        for atom in topology.atoms():
-            masses.append(atom.element.mass) # units of amu aka Dalton
+    num_atoms = len(masses)
+    # print(f"Number of atoms to simulate: {num_atoms}", flush=True)
+    # if masses is None:
+    #     masses = []
+    #     for atom in topology.atoms():
+    #         masses.append(atom.element.mass) # units of amu aka Dalton
 
     masses = np.array(masses).astype(np.float32)
 
@@ -98,11 +63,6 @@ def run_cg_sim(u_model, start_positions, masses=None, cfg="cg_sim.yaml"):
             torch.cuda.set_rng_state_all(chk['cuda'])
         np.random.set_state(chk['numpy'])
         random.setstate(chk['python'])
-    elif global_args["start_positions"] is None and start_positions is None:
-        print("No checkpoint or starting positions found. Starting from random positions.", flush=True)
-        init_x = torch.randn(batch_size, num_atoms, 3, requires_grad=True)
-        init_v = None
-        start_chk = 0
     elif start_positions is not None:
         print("Starting from provided starting positions.", flush=True)
         init_x = torch.tensor(start_positions, dtype=torch.float32)
@@ -110,13 +70,12 @@ def run_cg_sim(u_model, start_positions, masses=None, cfg="cg_sim.yaml"):
         init_v = None
         start_chk = 0
     else:
-        start_positions = torch.tensor(np.load(global_args["start_positions"]))
-        start_indices = np.load(global_args["start_indices"])
-        init_x = start_positions[start_indices, :, :]
-        init_x = init_x.reshape(-1, 3)
+        print("No checkpoint or starting positions found. Starting from random positions.", flush=True)
+        init_x = torch.randn(batch_size, num_atoms, 3, requires_grad=True)
         init_v = None
         start_chk = 0
 
+    print(f"{init_x.shape = }", flush=True)
     integrator = OVRVO(u_model, masses, batch_size = batch_size, **cfg["integrator_args"])
     generate_trajectory(integrator=integrator,
                         number_atoms=num_atoms, 
