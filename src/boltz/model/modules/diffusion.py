@@ -1309,7 +1309,9 @@ class AtomDiffusion(Module):
         with open(outdir / "likelihoods.json", "w") as f:
             json.dump(results, f, indent=2)
 
-    def set_force_parameters(self, batch_size, atom_mask, t_hat=1.0, temperature=300.0, bias_potential_path=None, **network_condition_kwargs):
+    def set_force_parameters(self, batch_size, atom_mask, t_hat=1.0, temperature=300.0, bias_potential_path=None,
+                             length_units="angstroms", energy_units="kilocalorie_per_mole",
+                             temperature_units="kelvin", **network_condition_kwargs):
         """Sets the temperature to use for the model force.
 
         Parameters
@@ -1328,9 +1330,20 @@ class AtomDiffusion(Module):
             self.bias_potential = None
         self.network_condition_kwargs_force = network_condition_kwargs
 
-        self.force_unit_conversion = (unit.BOLTZMANN_CONSTANT_kB * self.model_force_temperature * unit.kelvin * unit.AVOGADRO_CONSTANT_NA / unit.angstrom
-                                      ).value_in_unit(unit.kilocalorie / (unit.mole * unit.angstrom))
+        temperature_units = getattr(unit, temperature_units)
+        length_units = getattr(unit, length_units)
+        energy_units = getattr(unit, energy_units)
 
+        # boltz force is always in kT / angstroms, so convert to desired units
+
+        # only need to multiply by avogadro if energy is in per mole units
+        if energy_units in [unit.kilojoule_per_mole, unit.kilojoule_per_mole,
+                            unit.kilocalorie_per_mole, unit.kilocalories_per_mole]:
+            self.force_unit_conversion = (unit.BOLTZMANN_CONSTANT_kB * self.model_force_temperature * temperature_units * unit.AVOGADRO_CONSTANT_NA / unit.angstrom
+                                      ).value_in_unit(energy_units / length_units)
+        else:
+            self.force_unit_conversion = (unit.BOLTZMANN_CONSTANT_kB * self.model_force_temperature * temperature_units / unit.angstrom
+                                      ).value_in_unit(energy_units / length_units)
 
     # @torch.compile() #TODO: make sure this works with torch.compile
     def get_force(self, positions):
@@ -1356,7 +1369,8 @@ class AtomDiffusion(Module):
         # print(f"Getting forces for position shape {positions.shape}", flush=True)
 
         # Reshape input from (batch * n_atoms, 3) to (batch_size, n_atoms, 3)
-        positions_reshaped = positions.view(self.batch_size_force, -1, 3)
+        # positions_reshaped = positions.view(self.batch_size_force, -1, 3)
+        positions_reshaped = rearrange(positions, '(batch atoms) dim -> batch atoms dim', batch=self.batch_size_force)
         n_atoms = positions_reshaped.shape[1]
         
         # Pad coordinates to match the padded tensor shape expected by the model
@@ -1394,11 +1408,19 @@ class AtomDiffusion(Module):
             # Recompiled to compute the force using autograd in the forward call before jit
             with torch.set_grad_enabled(True):
                 bias_force = self.bias_potential(positions_reshaped)
+
+            # print(f"Bias force avg magnitude: {torch.mean(torch.norm(bias_force, dim=-1))}", flush=True)
+            nonzero_rows = torch.any(bias_force != 0.0, dim=-1)
+            nonzero_bias = bias_force[nonzero_rows]
+            print(f"Bias force avg magnitude (nonzero): {torch.mean(torch.norm(nonzero_bias, dim=-1))}", flush=True)
+            print(f"{torch.sum(nonzero_rows)/self.batch_size_force} atoms have nonzero bias force", flush=True)
+            print(f"Model force avg magnitude: {torch.mean(torch.norm(force, dim=-1))}", flush=True)
             force += bias_force        
 
 
         # Reshape back to (batch * n_atoms, 3)
-        return force.view(-1, 3)
+        force = rearrange(force, 'batch atoms dim -> (batch atoms) dim')
+        return force
 
     def run_umbrella(
         self,

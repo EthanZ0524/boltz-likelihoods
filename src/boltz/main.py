@@ -280,6 +280,27 @@ def get_cache_path() -> str:
     return str(Path("~/.boltz").expanduser())
 
 
+def get_next_umbrella_dir(base_dir: Path) -> Path:
+    """Find the next available umbrella directory name to avoid overwriting.
+    
+    Parameters
+    ----------
+    base_dir : Path
+        The base output directory where umbrella directories should be created.
+        
+    Returns
+    -------
+    Path
+        The path to the next available umbrella directory (e.g., umbrella_0, umbrella_1, etc.)
+    """
+    counter = 0
+    while True:
+        umbrella_dir = base_dir / f"umbrella_{counter}"
+        if not umbrella_dir.exists():
+            return umbrella_dir
+        counter += 1
+
+
 def check_inputs(data: Path) -> list[Path]:
     """Check the input data and output directory.
 
@@ -975,6 +996,104 @@ def cli() -> None:
     default=50.
 )
 @click.option(
+    "--umbrellav2_temperature",
+    type=float,
+    help=(
+        "Temperature for umbrella v2 simulations in Kelvin."
+    ),
+    default=300.0
+)
+@click.option(
+    "--umbrellav2_starting_positions",
+    type=click.Path(exists=True),
+    help=(
+        "Path to PDB file containing starting positions for umbrella v2 sampling."
+    ),
+    default=None
+)
+@click.option(
+    "--umbrellav2_bias_potential",
+    type=click.Path(exists=True),
+    help=(
+        "Path to the bias potential file for umbrella v2 sampling."
+    ),
+    default=None
+)
+@click.option(
+    "--umbrellav2_sim_config",
+    type=click.Path(exists=True),
+    help=(
+        "Path to the simulation configuration YAML file for umbrella v2."
+    ),
+    default=None
+)
+@click.option(
+    "--integrator_dt",
+    type=float,
+    help="Time step for integrator in picoseconds.",
+    default=0.001
+)
+@click.option(
+    "--integrator_friction",
+    type=float,
+    help="Friction coefficient for integrator.",
+    default=10.0
+)
+@click.option(
+    "--integrator_temperature",
+    type=float,
+    help="Temperature for integrator in Kelvin.",
+    default=300.0
+)
+@click.option(
+    "--integrator_length_units",
+    type=str,
+    help="Length units for integrator.",
+    default="angstroms"
+)
+@click.option(
+    "--integrator_energy_units",
+    type=str,
+    help="Energy units for integrator.",
+    default="kilocalories_per_mole"
+)
+@click.option(
+    "--integrator_time_units",
+    type=str,
+    help="Time units for integrator.",
+    default="picoseconds"
+)
+@click.option(
+    "--integrator_temperature_units",
+    type=str,
+    help="Temperature units for integrator.",
+    default="kelvin"
+)
+@click.option(
+    "--sim_num_data_points",
+    type=int,
+    help="Number of data points for simulation.",
+    default=100000
+)
+@click.option(
+    "--sim_batch_size",
+    type=int,
+    help="Batch size for simulation.",
+    default=10
+)
+@click.option(
+    "--sim_save_freq",
+    type=int,
+    help="Save frequency for simulation.",
+    default=10
+)
+@click.option(
+    "--sim_chk_freq",
+    type=int,
+    help="Checkpoint frequency for simulation.",
+    default=1000
+)
+@click.option(
     "--write_full_pae",
     type=bool,
     is_flag=True,
@@ -1150,6 +1269,21 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     umbrella_functor: str = None,
     umbrella_top: str = None,
     umbrella_temp: int = 50,
+    umbrellav2_temperature: float = 300.0,
+    umbrellav2_starting_positions: str = None,
+    umbrellav2_bias_potential: str = None,
+    umbrellav2_sim_config: str = None,
+    integrator_dt: float = 0.001,
+    integrator_friction: float = 10.0,
+    integrator_temperature: float = 300.0,
+    integrator_length_units: str = "angstroms",
+    integrator_energy_units: str = "kilocalories_per_mole",
+    integrator_time_units: str = "picoseconds",
+    integrator_temperature_units: str = "kelvin",
+    sim_num_data_points: int = 100000,
+    sim_batch_size: int = 10,
+    sim_save_freq: int = 10,
+    sim_chk_freq: int = 1000,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
@@ -1546,7 +1680,22 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                             feats=feats,
                             diffusion_stop=diffusion_stop,
                             recycling_steps=recycling_steps,
-                            starting_positions_pdb_path="/global/cfs/cdirs/m4235/boltz_files/bba/umbrella/all_bba_start_positions.pdb",
+                            starting_positions_pdb_path=umbrellav2_starting_positions,
+                            temperature=umbrellav2_temperature,
+                            bias_potential_path=umbrellav2_bias_potential,
+                            sim_config_path=umbrellav2_sim_config,
+                            integrator_dt=integrator_dt,
+                            integrator_friction=integrator_friction,
+                            integrator_temperature=integrator_temperature,
+                            integrator_length_units=integrator_length_units,
+                            integrator_energy_units=integrator_energy_units,
+                            integrator_time_units=integrator_time_units,
+                            integrator_temperature_units=integrator_temperature_units,
+                            sim_num_data_points=sim_num_data_points,
+                            sim_batch_size=sim_batch_size,
+                            sim_save_freq=sim_save_freq,
+                            sim_chk_freq=sim_chk_freq,
+                            out_dir=out_dir,
                         )
 
     # Check if affinity predictions are needed

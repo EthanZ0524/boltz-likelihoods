@@ -613,6 +613,21 @@ class Boltz1(LightningModule):
         diffusion_stop,
         recycling_steps,
         starting_positions_pdb_path,
+        temperature=300.0,
+        bias_potential_path=None,
+        sim_config_path=None,
+        integrator_dt=0.001,
+        integrator_friction=10.0,
+        integrator_temperature=300.0,
+        integrator_length_units="angstroms",
+        integrator_energy_units="kilocalories_per_mole",
+        integrator_time_units="picoseconds",
+        integrator_temperature_units="kelvin",
+        sim_num_data_points=100000,
+        sim_batch_size=10,
+        sim_save_freq=10,
+        sim_chk_freq=1000,
+        out_dir=None,
     ):
         """Outer wrapper of umbrella sampling calculations.
 
@@ -682,6 +697,7 @@ class Boltz1(LightningModule):
 
         n_starting_pos = md.load(starting_positions_pdb_path).n_frames
         for frame_index in range(n_starting_pos):
+            # coords are output in angstroms
             coords, elements, masses = pdb_to_boltz_coords(
                 pdb_file=starting_positions_pdb_path,
                 yaml_seq=sequences[0],
@@ -733,16 +749,48 @@ class Boltz1(LightningModule):
             batch_size=batch_size, 
             atom_mask=atom_mask,
             t_hat=float(t_hat), 
-            temperature=300.0, 
-            bias_potential_path="/global/cfs/cdirs/m4235/boltz_files/bba/bias_force_bba.pt", 
+            temperature=temperature, 
+            bias_potential_path=bias_potential_path, 
+            length_units=integrator_length_units,
+            energy_units=integrator_energy_units,
+            temperature_units=integrator_temperature_units,
             **network_condition_kwargs
         )
         
         print("Running Umbrella Simulation", flush=True)
+        
+        # Create config dictionary from individual parameters instead of loading YAML
+        # Use numbered umbrella directories to avoid overwriting on restart
+        if out_dir:
+            from boltz.main import get_next_umbrella_dir
+            umbrella_dir = get_next_umbrella_dir(out_dir)
+            umbrella_dir.mkdir(parents=True, exist_ok=True)
+            save_folder = str(umbrella_dir)
+        else:
+            save_folder = "./umbrella_output"
+        
+        integrator_config = {
+            "integrator_args": {
+                "dt": integrator_dt,
+                "friction": integrator_friction,
+                "temperature": integrator_temperature,
+                "length_units": integrator_length_units,
+                "energy_units": integrator_energy_units,
+                "time_units": integrator_time_units,
+                "temperature_units": integrator_temperature_units,
+            },
+            "global_args": {
+                "num_data_points": sim_num_data_points,
+                "save_freq": sim_save_freq,
+                "chk_freq": sim_chk_freq,
+                "save_folder_name": save_folder,
+            }
+        }
+        
         run_cg_sim(u_model=self.structure_module, 
                    start_positions=coord_sets,
                    masses=masses,
-                   cfg="/global/homes/d/dunne/boltz-likelihoods/src/sim/run_cg_sim.yaml")
+                   cfg=integrator_config)
 
 
     def forward(
