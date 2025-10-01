@@ -3,10 +3,13 @@ import torch
 import gc
 import numpy as np
 import random
+from time import time
+from einops import rearrange
 
 class TrajWriter:
     def __init__(self, filename, batch_size,
-                 num_atoms, num_data_points):
+                 num_atoms, num_data_points, length_units="angstroms", 
+                 energy_units="kilocalories_per_mole", time_units="picoseconds"):
         self.batch_size = batch_size
         self.num_atoms = num_atoms
         self.filename = filename
@@ -15,10 +18,17 @@ class TrajWriter:
                                  dtype='f4')
         self.file.create_dataset(f"positions", (num_data_points, batch_size, num_atoms, 3),
                                  dtype='f4')
+        self.file.create_dataset(f"time", (num_data_points,), dtype='f4')
+        
+        # Store unit information as file attributes
+        self.file.attrs["length_units"] = length_units
+        self.file.attrs["energy_units"] = energy_units
+        self.file.attrs["time_units"] = time_units
 
-    def write(self, positions, forces, frame):
-        self.file["positions"][frame] = positions.reshape(self.batch_size, self.num_atoms, 3)
-        self.file["forces"][frame] = forces.reshape(self.batch_size, self.num_atoms, 3)
+    def write(self, positions, forces, frame, simulation_time):
+        self.file["positions"][frame] = rearrange(positions, "(batch atom) dim -> batch atom dim", batch=self.batch_size)
+        self.file["forces"][frame] = rearrange(forces, "(batch atom) dim -> batch atom dim", batch=self.batch_size)
+        self.file["time"][frame] = simulation_time
         self.file.flush()
 
     def close(self):
@@ -41,9 +51,19 @@ def generate_trajectory(integrator, number_atoms, batch_size,
     num_checkpoints = num_data_points // chk_freq
     for i in range(start_chk, num_checkpoints):
         filename_chk = f"{save_filename}_{i}.hdf5"
-        writer = TrajWriter(filename_chk, batch_size, number_atoms, chk_freq)
-        init_x, init_v = integrator.integrate(init_x, init_v, chk_freq * save_freq, writer, save_freq)
+        writer = TrajWriter(filename_chk, batch_size, number_atoms, chk_freq,
+                           length_units=integrator.length_units,
+                           energy_units=integrator.energy_units,
+                           time_units=integrator.time_units)
         
+        # Set the starting time for this checkpoint based on previous simulation time
+        integrator.current_time_offset = i * chk_freq * save_freq * integrator.dt
+        
+        before_time = time()
+        init_x, init_v = integrator.integrate(init_x, init_v, chk_freq * save_freq, writer, save_freq)
+        after_time = time()
+        print(f"Integration time for checkpoint {i}: {(after_time - before_time) / 60} minutes", flush=True)
+
         ## Write checkpoint
         torch.save({
             'positions': init_x.cpu(),

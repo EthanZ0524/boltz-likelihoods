@@ -80,9 +80,15 @@ class OVRVO:
         f_prev = self.u_model.get_force(x) #energy_units/length_units
         f_prev = f_prev.detach()  # energy_units/length_units
         x = x.detach() # length_units
+        
+        # Get the current time offset if it exists, otherwise start at 0
+        time_offset = getattr(self, 'current_time_offset', 0.0)
+        
         for i in range(steps):
             if (i % save_freq) == 0:
-                writer.write(x.cpu(), f_prev.cpu(), i // save_freq)
+                # Calculate simulation time in the integrator's time units
+                simulation_time = time_offset + i * self.dt
+                writer.write(x.cpu(), f_prev.cpu(), i // save_freq, simulation_time)
             x, v, f_prev = self.ovrvo_step(x, v, f_prev)
         writer.close()
         return x, v
