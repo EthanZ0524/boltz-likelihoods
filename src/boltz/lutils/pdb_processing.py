@@ -130,7 +130,7 @@ def pdb_to_boltz_coords(
 
     atom_coords = {
         str(list(pdb.topology.atoms)[i]): (
-            pdb.xyz[frame_index][i],
+            pdb.xyz[frame_index][i], # gets this in nanometers because it's mdtraj
             atom.element.symbol,
             atom.element.mass
         )
