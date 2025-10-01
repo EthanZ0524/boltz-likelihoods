@@ -1371,41 +1371,31 @@ class AtomDiffusion(Module):
         # Reshape input from (batch * n_atoms, 3) to (batch_size, n_atoms, 3)
         # positions_reshaped = positions.view(self.batch_size_force, -1, 3)
         positions_reshaped = rearrange(positions, '(batch atoms) dim -> batch atoms dim', batch=self.batch_size_force)
+        # center the coordinates before padding
+        positions_reshaped = positions_reshaped - reduce(positions_reshaped, 'batch atoms dim -> batch 1 dim', 'mean')
         n_atoms = positions_reshaped.shape[1]
         
         # Pad coordinates to match the padded tensor shape expected by the model
         padding_dim = self.atom_mask.shape[-1] 
         rows_to_pad = padding_dim - n_atoms
         positions_padded = F.pad(positions_reshaped, pad=(0, 0, 0, rows_to_pad))
-        
-        # Center coordinates per batch
-        positions_centered = positions_padded - positions_padded.mean(dim=1, keepdim=True)
 
         atom_coords_denoised, _ = self.preconditioned_network_forward(
-                                    positions_centered,
+                                    positions_padded,
                                     self.t_hat_force,
                                     training=False,
                                     network_condition_kwargs=self.network_condition_kwargs_force
                                 )
         
         # Compute score from denoised coordinates
-        score_padded = (atom_coords_denoised - positions_centered) / (self.t_hat_force ** 2)
+        score_padded = (atom_coords_denoised - positions_padded) / (self.t_hat_force ** 2)
         
         # Unpad the score to get back to original n_atoms shape
         score = score_padded[:, :n_atoms, :].contiguous()
-        # print(f"{score.shape = }", flush=True)
-        # Convert score to force with proper units and multiply by kBT
+
         force = score * self.force_unit_conversion
         
         if self.bias_potential is not None:
-            # For bias potential, we need the unpadded positions with gradients
-            # Create a new tensor with requires_grad=True to ensure gradients are enabled
-            # positions_grad = torch.tensor(positions_reshaped.detach(), requires_grad=True)
-            # bias_energy = self.bias_potential(positions_grad)
-            # bias_force = -torch.autograd.grad(bias_energy, positions_grad, create_graph=True, 
-            #                                     grad_outputs=torch.ones_like(bias_energy))[0]
-            
-            # Recompiled to compute the force using autograd in the forward call before jit
             with torch.set_grad_enabled(True):
                 bias_force = self.bias_potential(positions_reshaped)
 
