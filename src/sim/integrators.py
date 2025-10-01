@@ -1,6 +1,7 @@
 import torch
 import math
 import openmm.unit
+from einops import rearrange, reduce, repeat
 
 class OVRVO:
     """
@@ -46,9 +47,13 @@ class OVRVO:
         masses_conversion_factor = unit_mass_omm.value_in_unit((unit_energy_omm * unit_time_omm**2/unit_length_omm**2).unit)
         self.masses = masses * masses_conversion_factor # energy_units * time_units^2 / length_units^2
         num_atoms = len(masses)
-        self.masses = self.masses.repeat_interleave(3, 0).reshape(num_atoms, 3) 
-        self.masses = self.masses.repeat(batch_size, 1, 1).reshape(batch_size * num_atoms, 3).to(u_model.device)
-        
+        # self.masses = self.masses.repeat_interleave(3, 0).reshape(num_atoms, 3) 
+        # einops equivalent: self.masses = einops.repeat(self.masses, 'n -> n 3')
+        # self.masses = self.masses.repeat(batch_size, 1, 1).reshape(batch_size * num_atoms, 3).to(u_model.device)
+        # einops equivalent: self.masses = einops.repeat(self.masses, 'n d -> b n d', b=batch_size); self.masses = einops.rearrange(self.masses, 'b n d -> (b n) d')
+
+        self.masses = repeat(self.masses, 'atoms -> (batch atoms) 3', batch=batch_size)
+
         self.temperature = temperature
         self.dt = dt_omm.value_in_unit(getattr(openmm.unit, time_units))
         self.kT = kT_omm.value_in_unit(getattr(openmm.unit, energy_units))
@@ -57,8 +62,6 @@ class OVRVO:
         self.t_rescale = torch.sqrt((2/(friction_omm * dt_omm)) 
                                     * torch.tanh(torch.tensor(friction_omm * dt_omm/2))) #unitless
         self.a = math.exp(-friction_omm * dt_omm)  # Unitless
-        # self.a = self.a.repeat_interleave(3, 0).reshape(num_atoms, 3) # Unitless
-        # self.a = self.a.repeat(batch_size, 1, 1).reshape(batch_size * num_atoms, 3)
         self.b = torch.sqrt(((1 - self.a) * self.kT)/self.masses) # length_units/time_units
         
 

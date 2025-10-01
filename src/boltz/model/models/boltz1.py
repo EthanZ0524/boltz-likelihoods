@@ -46,6 +46,7 @@ from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
 from boltz.lutils.pdb_processing import pdb_to_boltz_coords
 from sim import run_cg_sim
+from einops import rearrange, repeat, reduce
 
 class Boltz1(LightningModule):
     """Boltz1 model."""
@@ -721,16 +722,21 @@ class Boltz1(LightningModule):
         batch_size = coord_sets.shape[0]  # 100 coordinate sets
         
         # Expand conditioning tensors
-        s_expanded = s.repeat(batch_size, 1, 1)
-        z_expanded = z.repeat(batch_size, 1, 1, 1) 
-        s_inputs_expanded = s_inputs.repeat(batch_size, 1, 1)
-        relative_position_encoding_expanded = relative_position_encoding.repeat(batch_size, 1, 1, 1)
+        # s_expanded = s.repeat(batch_size, 1, 1) # old
+        s_expanded = repeat(s, '1 seq dim -> batch seq dim', batch=batch_size)
+        # z_expanded = z.repeat(batch_size, 1, 1, 1) # old
+        z_expanded = repeat(z, '1 seq1 seq2 dim -> batch seq1 seq2 dim', batch=batch_size)
+        # s_inputs_expanded = s_inputs.repeat(batch_size, 1, 1) # old
+        s_inputs_expanded = repeat(s_inputs, '1 seq dim -> batch seq dim', batch=batch_size)
+        # relative_position_encoding_expanded = relative_position_encoding.repeat(batch_size, 1, 1, 1) # old
+        relative_position_encoding_expanded = repeat(relative_position_encoding, '1 seq1 seq2 dim -> batch seq1 seq2 dim', batch=batch_size)
         
         # Expand feats to match batch size
         feats_expanded = {}
         for key, value in feats.items():
             if isinstance(value, torch.Tensor):
-                feats_expanded[key] = value.repeat(batch_size, *([1] * (value.dim() - 1)))
+                # feats_expanded[key] = value.repeat(batch_size, *([1] * (value.dim() - 1))) # old
+                feats_expanded[key] = repeat(value, '1 ... -> batch ...', batch=batch_size)
             else:
                 feats_expanded[key] = value  # Non-tensor values don't need expansion
         

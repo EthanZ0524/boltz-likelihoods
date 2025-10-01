@@ -6,6 +6,7 @@ import torch
 from sim import OVRVO, generate_trajectory, TrajWriter
 from omegaconf import OmegaConf
 import random
+from einops import rearrange, repeat, reduce
 
 # @hydra.main(version_base="1.3", config_path="../cfgs", config_name="cg_sim")
 # def main(cfg):
@@ -25,26 +26,13 @@ def run_cg_sim(u_model, start_positions, masses, cfg="cg_sim.yaml"):
         cfg = OmegaConf.create(cfg)
     print(cfg)
     global_args = cfg.global_args
-    # topology = md.load(global_args["pdb_file"]).topology
 
     if torch.cuda.is_available():
         u_model = u_model.cuda()
 
     u_model.eval()
-    # u_model.store_features(global_args["batch_size"], global_args["pdb_file"], 
-    #                        nn_config, prior_config, moe_config, edge_args)
-    # cfg.nn = nn_config
-    # cfg.prior = prior_config
-    # cfg.train = train_config
-    # OmegaConf.save(cfg, f"{global_args['save_folder_name']}/config.yaml")
 
-    # backbone = topology.select("name CA or name N or name C")
     num_atoms = len(masses)
-    # print(f"Number of atoms to simulate: {num_atoms}", flush=True)
-    # if masses is None:
-    #     masses = []
-    #     for atom in topology.atoms():
-    #         masses.append(atom.element.mass) # units of amu aka Dalton
 
     masses = np.array(masses).astype(np.float32)
 
@@ -66,12 +54,13 @@ def run_cg_sim(u_model, start_positions, masses, cfg="cg_sim.yaml"):
     elif start_positions is not None:
         print("Starting from provided starting positions.", flush=True)
         init_x = torch.tensor(start_positions, dtype=torch.float32)
-        init_x = init_x.reshape(-1, 3)
+        # init_x = init_x.reshape(-1, 3)
+        init_x = rearrange(init_x, "batch atoms dim -> (batch atoms) dim")
         init_v = None
         start_chk = 0
     else:
         print("No checkpoint or starting positions found. Starting from random positions.", flush=True)
-        init_x = torch.randn(batch_size, num_atoms, 3, requires_grad=True)
+        init_x = torch.randn(batch_size * num_atoms, 3, requires_grad=True)
         init_v = None
         start_chk = 0
 
