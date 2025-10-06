@@ -1369,16 +1369,35 @@ class AtomDiffusion(Module):
         # print(f"Getting forces for position shape {positions.shape}", flush=True)
 
         # Reshape input from (batch * n_atoms, 3) to (batch_size, n_atoms, 3)
-        # positions_reshaped = positions.view(self.batch_size_force, -1, 3)
         positions_reshaped = rearrange(positions, '(batch atoms) dim -> batch atoms dim', batch=self.batch_size_force)
         # center the coordinates before padding
         positions_reshaped = positions_reshaped - reduce(positions_reshaped, 'batch atoms dim -> batch 1 dim', 'mean')
         n_atoms = positions_reshaped.shape[1]
         
         # Pad coordinates to match the padded tensor shape expected by the model
-        padding_dim = self.atom_mask.shape[-1] 
+        # atom_mask's last dimension defines the model's padded atom count.
+        padding_dim = self.atom_mask.shape[-1]
         rows_to_pad = padding_dim - n_atoms
+        if rows_to_pad < 0:
+            raise ValueError(
+                f"positions contain more atoms ({n_atoms}) than the model's atom_mask padding ({padding_dim})."
+            )
         positions_padded = F.pad(positions_reshaped, pad=(0, 0, 0, rows_to_pad))
+
+        # Sanity check: ensure the padded tensor matches the atom mask width
+        if positions_padded.shape[1] != padding_dim:
+            raise RuntimeError(
+                f"Padding failed: expected padded atom dimension {padding_dim}, got {positions_padded.shape[1]}"
+            )
+
+        positions_padded = center_random_augmentation(
+            atom_coords=positions_padded, 
+            atom_mask=self.atom_mask,
+            augmentation=True,
+            centering=True,
+            return_second_coords=False,
+            second_coords=None,
+        )
 
         atom_coords_denoised, _ = self.preconditioned_network_forward(
                                     positions_padded,
