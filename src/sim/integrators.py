@@ -52,8 +52,8 @@ class OVRVO:
         # self.masses = self.masses.repeat(batch_size, 1, 1).reshape(batch_size * num_atoms, 3).to(u_model.device)
         # einops equivalent: self.masses = einops.repeat(self.masses, 'n d -> b n d', b=batch_size); self.masses = einops.rearrange(self.masses, 'b n d -> (b n) d')
 
-        self.masses = repeat(self.masses, 'atoms -> (batch atoms) 3', batch=batch_size)
-
+        self.masses = repeat(self.masses, 'atoms -> (batch atoms) 3', batch=batch_size).to(u_model.device)
+        torch.save(self.masses, 'masses_repeated.pt')
         self.temperature = temperature
         self.dt = dt_omm.value_in_unit(getattr(openmm.unit, time_units))
         self.kT = kT_omm.value_in_unit(getattr(openmm.unit, energy_units))
@@ -74,6 +74,7 @@ class OVRVO:
         f = f.detach()  # energy_units/length_units
         x = x.detach() # length_units
         v = v + 0.5 * self.dt * (f / self.masses) * self.t_rescale # length_units/time_units
+        # import pdb; pdb.set_trace()
         v = math.sqrt(self.a) * v + self.b * torch.randn_like(x) # length_units/time_units
         return x, v, f
 
@@ -91,7 +92,7 @@ class OVRVO:
             if (i % save_freq) == 0:
                 # Calculate simulation time in the integrator's time units
                 simulation_time = time_offset + i * self.dt
-                writer.write(x.cpu(), f_prev.cpu(), i // save_freq, simulation_time)
+                writer.write(x.cpu(), v.cpu(), f_prev.cpu(), i // save_freq, simulation_time)
             x, v, f_prev = self.ovrvo_step(x, v, f_prev)
         writer.close()
         return x, v
