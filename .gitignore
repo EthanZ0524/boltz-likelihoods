@@ -169,3 +169,10 @@ predictions/
 slurm*
 
 run_*.sh
+
+# these are just files from pdbs and amber that I use for debugging
+notebooks/*.pdb
+notebooks/*.prmtop
+notebooks/*.crd
+notebooks/*.in
+notebooks/*.inpcrd
