@@ -709,7 +709,7 @@ class Boltz1(LightningModule):
             )
             coord_list.append(coords)
         coord_sets = torch.stack(coord_list, axis=0)
-    
+        torch.save(masses, 'masses.pt')
 
         sigmas = self.structure_module.sample_schedule(200)
         gammas = torch.where(sigmas > self.structure_module.gamma_min, self.structure_module.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
