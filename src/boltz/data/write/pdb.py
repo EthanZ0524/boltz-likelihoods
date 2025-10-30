@@ -135,7 +135,6 @@ def to_pdb(
                 pdb_lines.append(atom_line)
                 atom_reindex_ter.append(atom_index)
                 atom_index += 1
-
             if record_type != "HETATM":
                 res_num += 1
 

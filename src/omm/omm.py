@@ -132,6 +132,7 @@ class Protein:
             pass
         else:
             positions = positions * length_units
+            print(self.simulation.context.getSystem().getNumParticles())
             self.simulation.context.setPositions(positions)
         if velocities is None:
             pass
@@ -286,7 +287,7 @@ class ProteinImplicit(Protein):
         else:
             positions = np.zeros((topology._numAtoms, 3))
 
-
+        print(positions.shape)
         if save_filename is None:
             save_filename = filename
         if chk == 0:

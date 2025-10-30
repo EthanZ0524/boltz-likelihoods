@@ -49,6 +49,7 @@ dependencies = [
     "pymbar>=4.0.3",
     "openmm>=8.3.1",
     "omegaconf>=2.3.0",
+    "jupyter>=1.1.1",
 ]
 
 [project.scripts]
