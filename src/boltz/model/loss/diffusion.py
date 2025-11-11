@@ -10,6 +10,7 @@ def weighted_rigid_align(
     pred_coords,
     weights,
     mask,
+    return_rotations=False,
 ):
     """Compute weighted alignment.
 
@@ -90,7 +91,8 @@ def weighted_rigid_align(
         + pred_centroid
     )
     aligned_coords.detach_()
-
+    if return_rotations:
+        return aligned_coords, rot_matrix
     return aligned_coords
 
 

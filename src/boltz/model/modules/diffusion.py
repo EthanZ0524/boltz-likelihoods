@@ -2529,7 +2529,7 @@ class AtomDiffusion(Module):
             )
         else:
             sigmas = self.noise_distribution(batch_size * multiplicity)
-        padded_sigmas = rearrange(sigmas, "b -> b 1 1")
+        padded_sigmas = rearrange(sigmas, "b -> b 1 1") 
 
         atom_coords = feats["coords"]
         B, N, L = atom_coords.shape[0:3]
@@ -2576,6 +2576,7 @@ class AtomDiffusion(Module):
         nucleotide_loss_weight=5.0,
         ligand_loss_weight=10.0,
         multiplicity=1,
+        loss_type="standard", # standard for Boltz1 objective or force_matching for force matching
     ):
         denoised_atom_coords = out_dict["denoised_atom_coords"]
         noised_atom_coords = out_dict["noised_atom_coords"]
@@ -2606,26 +2607,36 @@ class AtomDiffusion(Module):
         )
 
         with torch.no_grad(), torch.autocast("cuda", enabled=False):
-            atom_coords = out_dict["aligned_true_atom_coords"]
-            atom_coords_aligned_ground_truth = weighted_rigid_align(
+            atom_coords = out_dict["aligned_true_atom_coords"] # starting ground truth coords, need to align
+            atom_coords_aligned_ground_truth, rotations = weighted_rigid_align(
                 atom_coords.detach().float(),
                 denoised_atom_coords.detach().float(),
                 align_weights.detach().float(),
                 mask=resolved_atom_mask.detach().float(),
+                return_rotations=True,
             )
 
         # Cast back
         atom_coords_aligned_ground_truth = atom_coords_aligned_ground_truth.to(
             denoised_atom_coords
         )
-
-        # weighted MSE loss of denoised atom positions
-        mse_loss = ((denoised_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(
-            dim=-1
-        )
-        mse_loss = torch.sum(
-            mse_loss * align_weights * resolved_atom_mask, dim=-1
-        ) / torch.sum(3 * align_weights * resolved_atom_mask, dim=-1)
+        if loss_type == "standard":
+            # weighted MSE loss of denoised atom positions
+            mse_loss = ((denoised_atom_coords - atom_coords_aligned_ground_truth) ** 2).sum(
+                dim=-1
+            )
+            mse_loss = torch.sum(
+                mse_loss * align_weights * resolved_atom_mask, dim=-1
+            ) / torch.sum(3 * align_weights * resolved_atom_mask, dim=-1)
+        elif loss_type == "force_matching":
+            padded_sigmas = rearrange(sigmas, "b -> b 1 1")
+            score = (denoised_atom_coords - atom_coords_aligned_ground_truth) / (padded_sigmas ** 2)
+            force_predicted = self.force_unit_conversion * score  # F = kT * score
+            force_aligned_ground_truth = einsum(gt_force, rotations, "b n i, b j i -> b n j")
+            mse_loss = ((force_predicted - force_aligned_ground_truth) ** 2).sum(dim=-1)
+            mse_loss = torch.sum(
+                mse_loss * align_weights * resolved_atom_mask, dim=-1
+            ) / torch.sum(3 * align_weights * resolved_atom_mask, dim=-1)
 
         # weight by sigma factor
         loss_weights = self.loss_weight(sigmas)
