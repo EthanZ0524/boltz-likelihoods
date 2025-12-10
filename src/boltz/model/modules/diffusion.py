@@ -2632,6 +2632,7 @@ class AtomDiffusion(Module):
             padded_sigmas = rearrange(sigmas, "b -> b 1 1")
             score = (denoised_atom_coords - atom_coords_aligned_ground_truth) / (padded_sigmas ** 2)
             force_predicted = self.force_unit_conversion * score  # F = kT * score
+            #TODO: add in a gt_force accessible to the dataset
             force_aligned_ground_truth = einsum(gt_force, rotations, "b n i, b j i -> b n j")
             mse_loss = ((force_predicted - force_aligned_ground_truth) ** 2).sum(dim=-1)
             mse_loss = torch.sum(
