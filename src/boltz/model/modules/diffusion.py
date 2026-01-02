@@ -1406,6 +1406,18 @@ class AtomDiffusion(Module):
                                     network_condition_kwargs=self.network_condition_kwargs_force
                                 )
         
+        # Kabsch aligning the denoised coordinates to the input positions.
+        # weighted_rigid_align aligns the first argument to the second.
+        with torch.autocast("cuda", enabled=False):
+            atom_coords_denoised = weighted_rigid_align(
+                atom_coords_denoised.float(),
+                positions_padded.float(),
+                self.atom_mask.float(),
+                self.atom_mask.float(),
+            )
+
+            positions_padded = positions_padded.to(atom_coords_denoised)
+        
         # Compute score from denoised coordinates
         score_padded = (atom_coords_denoised - positions_padded) / (self.t_hat_force ** 2)
         
@@ -2478,6 +2490,8 @@ class AtomDiffusion(Module):
                             times=self.c_noise(sigma), acc_a=token_repr, next_a=token_a
                         )
 
+                # Perform rigid Kabsch alignment between noisy and denoised 
+                # coordinates prior to interpolation.
                 if self.alignment_reverse_diff:
                     with torch.autocast("cuda", enabled=False):
                         atom_coords_noisy = weighted_rigid_align(
