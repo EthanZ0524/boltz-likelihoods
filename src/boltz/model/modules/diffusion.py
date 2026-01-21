@@ -1433,9 +1433,17 @@ class AtomDiffusion(Module):
             # print(f"Bias force avg magnitude: {torch.mean(torch.norm(bias_force, dim=-1))}", flush=True)
             nonzero_rows = torch.any(bias_force != 0.0, dim=-1)
             nonzero_bias = bias_force[nonzero_rows]
-            print(f"Bias force avg magnitude (nonzero): {torch.mean(torch.norm(nonzero_bias, dim=-1))}", flush=True)
-            print(f"{torch.sum(nonzero_rows)/self.batch_size_force} atoms have nonzero bias force", flush=True)
-            print(f"Model force avg magnitude: {torch.mean(torch.norm(force, dim=-1))}", flush=True)
+            tqdm.write(
+                f"Bias force avg magnitude (nonzero): "
+                f"{torch.mean(torch.norm(nonzero_bias, dim=-1))}"
+            )
+            tqdm.write(
+                f"{torch.sum(nonzero_rows)/self.batch_size_force} atoms have nonzero bias force"
+            )
+            tqdm.write(
+                f"Model force avg magnitude: "
+                f"{torch.mean(torch.norm(force, dim=-1))}"
+            )
             force += bias_force        
 
 
