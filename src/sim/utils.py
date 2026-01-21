@@ -5,6 +5,7 @@ import numpy as np
 import random
 from time import time
 from einops import rearrange
+from tqdm import tqdm
 
 class TrajWriter:
     def __init__(self, filename, batch_size,
@@ -52,7 +53,12 @@ def generate_trajectory(integrator, number_atoms, batch_size,
     init_v = init_v.to(integrator.u_model.device)
     
     num_checkpoints = num_data_points // chk_freq
-    for i in range(start_chk, num_checkpoints):
+    for i in tqdm(
+        range(start_chk, num_checkpoints),
+        desc="Simulation progress (number of checkpoints)",
+        ncols=80,
+        mininterval=300,
+    ):
         filename_chk = f"{save_filename}_{i}.hdf5"
         writer = TrajWriter(filename_chk, batch_size, number_atoms, chk_freq,
                            length_units=integrator.length_units,
