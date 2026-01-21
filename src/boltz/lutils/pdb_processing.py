@@ -37,8 +37,9 @@ def pdb_to_boltz_coords(
     atom_mask : torch.tensor
         Tensor generated through running Pairformer of the inputted YAML
         seq or previously generated and loaded in tensors.hdf5 in 
-        Boltz1._load_head_init(). The atom coordinates are padded to
-        match atom_mask's dimensions to be properly shaped for Boltz.
+        Boltz1._load_head_init(). By default, the atom coordinates are 
+        padded to match atom_mask's dimensions to be properly shaped for 
+        Boltz. (See apply_padding parameter below).
 
     device : str
 
