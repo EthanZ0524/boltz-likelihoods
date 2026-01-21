@@ -630,14 +630,14 @@ class Boltz1(LightningModule):
         sim_chk_freq=1000,
         out_dir=None,
     ):
-        """Outer wrapper of umbrella sampling calculations.
-
-        Checks head_init inputs - if no Pairformer outputs are provided, 
-        runs the Pairformer. Checks if the required umbrella.json is 
-        provided and processes it if it does (throws an error if not). 
+        """Performs umbrella sampling simulations using OVRVO integrator.
 
         Parameters
         ----------
+        starting_positions_pdb_path : str
+            Path to PDB file containing coordinates for each umbrella
+            window's starting positions.
+            
         umbrella_steps : int
             Number of simulation steps to run per umbrella window.
 
@@ -689,10 +689,6 @@ class Boltz1(LightningModule):
         z = tensor_dict['z']
         s_inputs = tensor_dict['s_inputs']
         relative_position_encoding = tensor_dict['relative_position_encoding']
-        
-        # Retrieving umbrella simulation input coordinates.
-        # with open(umbrella_json, 'r') as file:
-        #     param_dict = json.load(file)
 
         coord_list = []        
 
