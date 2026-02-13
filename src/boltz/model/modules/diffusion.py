@@ -1330,34 +1330,33 @@ class AtomDiffusion(Module):
             self.bias_potential = None
         self.network_condition_kwargs_force = network_condition_kwargs
 
-        temperature_units = getattr(unit, temperature_units)
-        length_units = getattr(unit, length_units)
-        energy_units = getattr(unit, energy_units)
+        self.temperature_units = getattr(unit, temperature_units)
+        self.length_units = getattr(unit, length_units)
+        self.energy_units = getattr(unit, energy_units)
 
         # boltz force is always in kT / angstroms, so convert to desired units
 
         # only need to multiply by avogadro if energy is in per mole units
-        if energy_units in [unit.kilojoule_per_mole, unit.kilojoule_per_mole,
-                            unit.kilocalorie_per_mole, unit.kilocalories_per_mole]:
-            self.force_unit_conversion = (unit.BOLTZMANN_CONSTANT_kB * self.model_force_temperature * temperature_units * unit.AVOGADRO_CONSTANT_NA / unit.angstrom
-                                      ).value_in_unit(energy_units / length_units)
+        if self.energy_units.is_compatible(unit.kilojoule_per_mole):
+            self.force_unit_conversion = (unit.BOLTZMANN_CONSTANT_kB * self.model_force_temperature * self.temperature_units * unit.AVOGADRO_CONSTANT_NA / unit.angstrom
+                                      ).value_in_unit(self.energy_units / self.length_units)
         else:
-            self.force_unit_conversion = (unit.BOLTZMANN_CONSTANT_kB * self.model_force_temperature * temperature_units / unit.angstrom
-                                      ).value_in_unit(energy_units / length_units)
-
+            self.force_unit_conversion = (unit.BOLTZMANN_CONSTANT_kB * self.model_force_temperature * self.temperature_units / unit.angstrom
+                                      ).value_in_unit(self.energy_units / self.length_units)
+            
     # @torch.compile() #TODO: make sure this works with torch.compile
-    def get_force(self, positions):
+    def get_force(self, positions, batched_input_output=False):
         """Computes the forces acting on the given positions.
 
         Parameters
         ----------
         positions : torch.Tensor
-            The atomic positions to compute forces for, of shape (batch * n_atoms, 3). Units of angstroms
+            The atomic positions to compute forces for, of shape (batch * n_atoms, 3) if batched_input_output is False, else (batch, n_atoms, 3). Units of angstroms
 
         Returns
         -------
         torch.Tensor
-            The computed forces, of shape (batch * n_atoms, 3). Units of kcal/(mol*angstrom)
+            The computed forces, of shape (batch * n_atoms, 3) if batched_input_output is False, else (batch, n_atoms, 3). Units of kcal/(mol*angstrom)
         """
         assert self.model_force_temperature is not None, \
             "Model force temperature not set. Please call set_force_parameters()."
@@ -1369,7 +1368,10 @@ class AtomDiffusion(Module):
         # print(f"Getting forces for position shape {positions.shape}", flush=True)
 
         # Reshape input from (batch * n_atoms, 3) to (batch_size, n_atoms, 3)
-        positions_reshaped = rearrange(positions, '(batch atoms) dim -> batch atoms dim', batch=self.batch_size_force)
+        if not batched_input_output:
+            positions_reshaped = rearrange(positions, '(batch atoms) dim -> batch atoms dim', batch=self.batch_size_force)
+        else:
+            positions_reshaped = positions
         # center the coordinates before padding
         positions_reshaped = positions_reshaped - reduce(positions_reshaped, 'batch atoms dim -> batch 1 dim', 'mean')
         n_atoms = positions_reshaped.shape[1]
@@ -1448,8 +1450,14 @@ class AtomDiffusion(Module):
 
 
         # Reshape back to (batch * n_atoms, 3)
-        force = rearrange(force, 'batch atoms dim -> (batch atoms) dim')
+        if not batched_input_output:    
+            force = rearrange(force, 'batch atoms dim -> (batch atoms) dim')
         return force
+    
+    def get_score_and_energy_kt(self, positions, beta):
+        # returns the score (gradient of log probability) and energy in units of kT. Note that the energy is only the part of the energy from the model force, not including any bias potential.
+        # beta should be in inverse units of the model energy
+        return beta * self.get_force(positions, batched_input_output=True), None
 
     def run_umbrella(
         self,

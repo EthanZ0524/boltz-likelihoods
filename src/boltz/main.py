@@ -1012,6 +1012,11 @@ def cli() -> None:
     default=None
 )
 @click.option(
+    "--umbrellav2_use_overdamped",
+    is_flag=True,
+    help="Whether to use the overdamped Langevin integrator for umbrella v2 sampling. Default is False.",
+)
+@click.option(
     "--umbrellav2_bias_potential",
     type=click.Path(exists=True),
     help=(
@@ -1271,6 +1276,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     umbrella_temp: int = 50,
     umbrellav2_temperature: float = 300.0,
     umbrellav2_starting_positions: str = None,
+    umbrellav2_use_overdamped: bool = False,
     umbrellav2_bias_potential: str = None,
     umbrellav2_sim_config: str = None,
     integrator_dt: float = 0.001,
@@ -1682,6 +1688,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                             recycling_steps=recycling_steps,
                             starting_positions_pdb_path=umbrellav2_starting_positions,
                             temperature=umbrellav2_temperature,
+                            use_overdamped=umbrellav2_use_overdamped,
                             bias_potential_path=umbrellav2_bias_potential,
                             sim_config_path=umbrellav2_sim_config,
                             integrator_dt=integrator_dt,
