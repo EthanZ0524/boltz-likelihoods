@@ -558,6 +558,8 @@ class AtomDiffusion(Module):
                 The step size to use during Langevin sampling.
             langevin_noise_scale : float
                 The noise scale to use during Langevin sampling.
+            stride : int
+                Stride for saving simulations.
             outdir : str
                 The directory at which to store trajectories.
             record_id : str
@@ -676,6 +678,7 @@ class AtomDiffusion(Module):
         langevin_sampling_steps = langevin_args["langevin_sampling_steps"]
         l_eps = langevin_args["langevin_eps"]
         langevin_noise_scale = langevin_args["langevin_noise_scale"]
+        stride = langevin_args["stride"]
         record_id = langevin_args["record_id"]
         outdir = langevin_args["outdir"]
 
@@ -693,7 +696,7 @@ class AtomDiffusion(Module):
         traj_dir = (outdir / record_id).expanduser().resolve(strict=False)
         traj_dir.mkdir(parents=True, exist_ok=True)        
 
-        for _ in tqdm(
+        for step in tqdm(
             range(langevin_sampling_steps), 
             desc='Langevin steps',
             mininterval=10
@@ -728,41 +731,42 @@ class AtomDiffusion(Module):
                 atom_coords_next 
                 - atom_coords_next.mean(dim=1, keepdim=True)
             )  # Centering to origin.
+            
+            if step % stride == 0: 
+                with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "a") as f:
+                    if 'traj' not in f:
+                        traj_dset = f.create_dataset(
+                            "traj",
+                            shape=(0, *atom_coords_unpadded_shape),
+                            maxshape=(None, *atom_coords_unpadded_shape),
+                            dtype='float32',
+                            chunks=(1, *atom_coords_unpadded_shape)
+                        )
+                    else:
+                        traj_dset = f['traj']
 
-            with h5py.File(os.path.join(traj_dir, "traj_and_scores.h5"), "a") as f:
-                if 'traj' not in f:
-                    traj_dset = f.create_dataset(
-                        "traj",
-                        shape=(0, *atom_coords_unpadded_shape),
-                        maxshape=(None, *atom_coords_unpadded_shape),
-                        dtype='float32',
-                        chunks=(1, *atom_coords_unpadded_shape)
-                    )
-                else:
-                    traj_dset = f['traj']
+                    if 'scores' not in f:
+                        score_dset = f.create_dataset(
+                            "scores",
+                            shape=(0, *atom_coords_unpadded_shape),
+                            maxshape=(None, *atom_coords_unpadded_shape),
+                            dtype='float32',
+                            chunks=(1, *atom_coords_unpadded_shape)
+                        )
+                    else:
+                        score_dset = f['scores']
 
-                if 'scores' not in f:
-                    score_dset = f.create_dataset(
-                        "scores",
-                        shape=(0, *atom_coords_unpadded_shape),
-                        maxshape=(None, *atom_coords_unpadded_shape),
-                        dtype='float32',
-                        chunks=(1, *atom_coords_unpadded_shape)
-                    )
-                else:
-                    score_dset = f['scores']
+                    # Unpad, write the score + coordinates and update.
+                    coords_unpadded = atom_coords_next[:, atom_mask[0].bool(), :]
+                    coords_np = coords_unpadded.cpu().numpy()
+                    traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
+                    traj_dset[-1, :, :, :] = coords_np
 
-                # Unpad, write the score + coordinates and update.
-                coords_unpadded = atom_coords_next[:, atom_mask[0].bool(), :]
-                coords_np = coords_unpadded.cpu().numpy()
-                traj_dset.resize(traj_dset.shape[0] + 1, axis=0)
-                traj_dset[-1, :, :, :] = coords_np
-
-                score_unpadded = score[:, atom_mask[0].bool(), :]
-                score_np = score_unpadded.cpu().numpy()
-                score_dset.resize(score_dset.shape[0] + 1, axis=0)
-                score_dset[-1, :, :, :] = score_np
-                atom_coords_curr = atom_coords_next
+                    score_unpadded = score[:, atom_mask[0].bool(), :]
+                    score_np = score_unpadded.cpu().numpy()
+                    score_dset.resize(score_dset.shape[0] + 1, axis=0)
+                    score_dset[-1, :, :, :] = score_np
+                    atom_coords_curr = atom_coords_next
                 
         # Initial seed structures will be saved.
         # If given PDB starting structures, they will be re-saved.
