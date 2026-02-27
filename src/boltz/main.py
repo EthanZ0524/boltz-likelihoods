@@ -841,6 +841,12 @@ def cli() -> None:
     default=1.0
 )
 @click.option(
+    "--stride",
+    type=int,
+    help="Saving every n-th frame of Langevin simulations.",
+    default=100
+)
+@click.option(
     "--replicates",
     type=int,
     help="Number of replicates ran for each Langevin initial struct.",
@@ -1249,6 +1255,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     langevin_sampling_steps: int = 5000,
     langevin_eps: float = 1e-3,
     langevin_noise_scale: float = 1.0,
+    stride: int = 100,
     replicates: int = 1,
     head_init: str = None,
     save_conditioning_args: bool = False,
@@ -1592,6 +1599,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "langevin_sampling_steps": langevin_sampling_steps,
             "langevin_eps": langevin_eps,
             "langevin_noise_scale": langevin_noise_scale,
+            "stride": stride,
             "outdir": out_dir / "trajectories",
             "replicates": replicates
         }
