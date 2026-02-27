@@ -45,7 +45,7 @@ from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
 from boltz.lutils.pdb_processing import pdb_to_boltz_coords
-from sim import run_cg_sim
+from sim import run_cg_sim, run_langevin
 from einops import rearrange, repeat, reduce
 
 class Boltz1(LightningModule):
@@ -615,6 +615,7 @@ class Boltz1(LightningModule):
         recycling_steps,
         starting_positions_pdb_path,
         temperature=300.0,
+        use_overdamped=False,
         bias_potential_path=None,
         sim_config_path=None,
         integrator_dt=0.001,
@@ -789,11 +790,24 @@ class Boltz1(LightningModule):
             }
         }
         
-        run_cg_sim(u_model=self.structure_module, 
-                   start_positions=coord_sets,
-                   masses=masses,
-                   cfg=integrator_config)
 
+        if use_overdamped:
+            run_langevin(
+                initial_x=coord_sets, 
+                cg_model=self.structure_module, 
+                num_steps=sim_num_data_points * sim_save_freq, 
+                step_size=integrator_dt, 
+                temperature=integrator_temperature, 
+                temperature_units=integrator_temperature_units, 
+                energy_units=integrator_energy_units, 
+                save_freq=sim_save_freq, 
+                save_folder=save_folder
+            )
+        else:
+            run_cg_sim(u_model=self.structure_module, 
+                    start_positions=coord_sets,
+                    masses=masses,
+                    cfg=integrator_config)
 
     def forward(
         self,
