@@ -16,7 +16,6 @@ from boltz.model.loss.diffusion import (
     smooth_lddt_loss,
     weighted_rigid_align,
 )
-from boltz.model.modules.utils import center_random_augmentation
 from boltz.model.modules.encoders import (
     AtomAttentionDecoder,
     AtomAttentionEncoder,
@@ -1396,13 +1395,10 @@ class AtomDiffusion(Module):
                 f"Padding failed: expected padded atom dimension {padding_dim}, got {positions_padded.shape[1]}"
             )
 
-        positions_padded = center_random_augmentation(
-            atom_coords=positions_padded, 
-            atom_mask=self.atom_mask,
-            augmentation=True,
-            centering=True,
-            return_second_coords=False,
-            second_coords=None,
+        # Random augmentation of current coordinates for score calcs.
+        R, t = compute_random_augmentation(positions_padded.shape[0], device=positions_padded.device)
+        positions_padded = (
+            torch.einsum("bmd,bds->bms", positions_padded, R) + t
         )
 
         atom_coords_denoised, _ = self.preconditioned_network_forward(
@@ -1412,7 +1408,7 @@ class AtomDiffusion(Module):
                                     network_condition_kwargs=self.network_condition_kwargs_force
                                 )
         
-        # Kabsch aligning the denoised coordinates to the input positions.
+        # Kabsch aligning the denoised coordinates to the augmented positions.
         # weighted_rigid_align aligns the first argument to the second.
         with torch.autocast("cuda", enabled=False):
             atom_coords_denoised = weighted_rigid_align(
@@ -1424,12 +1420,14 @@ class AtomDiffusion(Module):
 
             positions_padded = positions_padded.to(atom_coords_denoised)
         
-        # Compute score from denoised coordinates
-        score_padded = (atom_coords_denoised - positions_padded) / (self.t_hat_force ** 2)
-        
-        # Unpad the score to get back to original n_atoms shape
-        score = score_padded[:, :n_atoms, :].contiguous()
+        # Compute (rotated) score from denoised coordinates
+        score_rotated_padded = (atom_coords_denoised - positions_padded) / (self.t_hat_force ** 2)
 
+        # Undo rotation from augmentation
+        score_unrotated_padded = torch.einsum("bmd,bsd->bms", score_rotated_padded, R)
+
+        # Unpad the score to get back to original n_atoms shape
+        score = score_unrotated_padded[:, :n_atoms, :].contiguous()
         force = score * self.force_unit_conversion
         
         if self.bias_potential is not None:
