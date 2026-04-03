@@ -26,12 +26,6 @@ class OVRVO:
         self.time_units = time_units
         self.temperature_units = temperature_units
 
-        '''TODO: self.masses must be a torch tensor in internal units of 
-        energy_units * time_units^2 / length_units^2, and kT needs to 
-        be in internal energy_units. This is because utils.py will do
-        scale = (integrator.kT/ integrator.masses) ** 0.5 to set
-        initial velocities. 
-        '''
         masses = 0.001 * torch.tensor(masses) # Converting masses from amu (g/mol) to kg/mol.
         unit_length_omm = 1.0 * getattr(unit, length_units)
         unit_energy_omm = 1.0 * getattr(unit, energy_units)

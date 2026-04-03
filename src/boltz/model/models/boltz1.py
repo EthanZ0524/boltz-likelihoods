@@ -625,6 +625,7 @@ class Boltz1(LightningModule):
         integrator_energy_units="kilocalories_per_mole",
         integrator_time_units="picoseconds",
         integrator_temperature_units="kelvin",
+        integrator="OVRVO",
         sim_num_data_points=100000,
         sim_batch_size=10,
         sim_save_freq=10,
@@ -804,10 +805,13 @@ class Boltz1(LightningModule):
                 save_folder=save_folder
             )
         else:
-            run_cg_sim(u_model=self.structure_module, 
-                    start_positions=coord_sets,
-                    masses=masses,
-                    cfg=integrator_config)
+            run_cg_sim(
+                u_model=self.structure_module, 
+                start_positions=coord_sets,
+                masses=masses,
+                cfg=integrator_config,
+                integrator=integrator
+            )
 
     def forward(
         self,

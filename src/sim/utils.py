@@ -29,9 +29,16 @@ class TrajWriter:
         self.file.attrs["time_units"] = time_units
 
     def write(self, positions, velocities, forces, frame, simulation_time):
-        self.file["positions"][frame] = rearrange(positions, "(batch atom) dim -> batch atom dim", batch=self.batch_size)
-        self.file["velocities"][frame] = rearrange(velocities, "(batch atom) dim -> batch atom dim", batch=self.batch_size)
-        self.file["forces"][frame] = rearrange(forces, "(batch atom) dim -> batch atom dim", batch=self.batch_size)
+        """Writes simulation information to h5py file. 
+
+        Assumes positions, velocities, and forces tensors are shaped 
+        either (batch * atom, dim) or (batch, atom, dim). Reshapes 
+        them to (batch, atom, dim) before writing to file.
+        """
+        self.file["positions"][frame] = positions.reshape(self.batch_size, -1, positions.shape[-1])
+        self.file["velocities"][frame] = velocities.reshape(self.batch_size, -1, velocities.shape[-1])
+        self.file["forces"][frame] = forces.reshape(self.batch_size, -1, forces.shape[-1])
+
         self.file["time"][frame] = simulation_time
         self.file.flush()
 

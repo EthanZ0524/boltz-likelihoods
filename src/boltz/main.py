@@ -1081,6 +1081,15 @@ def cli() -> None:
     default="kelvin"
 )
 @click.option(
+    "--integrator",
+    type=str,
+    help=(
+        "Integrator to use for simulations. "
+        "Options are 'OVRVO' and 'Brownian'"
+    ),
+    default="OVRVO",
+)
+@click.option(
     "--sim_num_data_points",
     type=int,
     help="Number of data points for simulation.",
@@ -1293,6 +1302,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     integrator_energy_units: str = "kilocalories_per_mole",
     integrator_time_units: str = "picoseconds",
     integrator_temperature_units: str = "kelvin",
+    integrator: str = "OVRVO",
     sim_num_data_points: int = 100000,
     sim_batch_size: int = 10,
     sim_save_freq: int = 10,
@@ -1706,6 +1716,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                             integrator_energy_units=integrator_energy_units,
                             integrator_time_units=integrator_time_units,
                             integrator_temperature_units=integrator_temperature_units,
+                            integrator=integrator,
                             sim_num_data_points=sim_num_data_points,
                             sim_batch_size=sim_batch_size,
                             sim_save_freq=sim_save_freq,
