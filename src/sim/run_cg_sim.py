@@ -3,14 +3,20 @@ import numpy as np
 import mdtraj as md
 # import hydra
 import torch
-from sim import OVRVO, generate_trajectory, TrajWriter
+from sim import OVRVO, Brownian, generate_trajectory, TrajWriter
 from omegaconf import OmegaConf
 import random
 from einops import rearrange, repeat, reduce
 
 # @hydra.main(version_base="1.3", config_path="../cfgs", config_name="cg_sim")
 # def main(cfg):
-def run_cg_sim(u_model, start_positions, masses, cfg="cg_sim.yaml"):
+def run_cg_sim(
+    u_model, 
+    start_positions, 
+    masses, 
+    cfg="cg_sim.yaml",
+    integrator="OVRVO"
+):
     """
     u_model: nn.Module subclass that has a get_forces(positions) method. The bias force should be included in this model if desired.
     start_positions: np.ndarray of shape (batch_size, n_atoms, 3) defining the initial positions of the system.
@@ -65,7 +71,24 @@ def run_cg_sim(u_model, start_positions, masses, cfg="cg_sim.yaml"):
         start_chk = 0
 
     print(f"{init_x.shape = }", flush=True)
-    integrator = OVRVO(u_model, masses, batch_size = batch_size, **cfg["integrator_args"])
+
+    if integrator == 'OVRVO':
+        integrator = OVRVO(
+            u_model, 
+            masses, 
+            batch_size=batch_size, 
+            **cfg["integrator_args"]
+        )
+    elif integrator == 'Brownian':
+        integrator = Brownian(
+            u_model, 
+            masses,
+            batch_size=batch_size,
+            **cfg["integrator_args"]
+        )
+    else:
+        raise ValueError('Invalid integrator. Options: "OVRVO", "Brownian".')
+
     generate_trajectory(integrator=integrator,
                         number_atoms=num_atoms, 
                         batch_size=batch_size,
