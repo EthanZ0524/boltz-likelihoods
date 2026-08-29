@@ -1,0 +1,26 @@
+Bad value in file PosixPath('/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/matplotlib/mpl-data/stylelib/rotskoff_cmap.mplstyle'), line 18 ('axes.prop_cycle: cycler("color", [\'#00386b\', \'#00679f\', \'#1b9ad0\', \'#54cffb\', \'#fbac41\', \'#fa8f34\', \'#f87026\', \'#f54b1a\'])'): Key axes.prop_cycle: 'cycler("color", [\'' is not a valid cycler construction: unterminated string literal (detected at line 1) (<unknown>, line 1)
+Bad value in file PosixPath('/home/ethanz/.config/matplotlib/stylelib/rotskoff_cmap.mplstyle'), line 18 ('axes.prop_cycle: cycler("color", [\'#00386b\', \'#00679f\', \'#1b9ad0\', \'#54cffb\', \'#fbac41\', \'#fa8f34\', \'#f87026\', \'#f54b1a\'])'): Key axes.prop_cycle: 'cycler("color", [\'' is not a valid cycler construction: unterminated string literal (detected at line 1) (<unknown>, line 1)
+Finished with energy minimization.
+Done equilibrating, saved checkpoint.
+100 step sanity check done.
+Traceback (most recent call last):
+  File "/home/ethanz/boltz-likelihoods/SPLASH/run_chignolin_mtd.py", line 90, in <module>
+    meta.step(simulation, 1e8) # 2fs * 1e8 = 200 ns.
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/openmm/app/metadynamics.py", line 172, in step
+    simulation.step(nextSteps)
+  File "/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/openmm/app/simulation.py", line 150, in step
+    self._simulate(endStep=self.currentStep+steps)
+  File "/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/openmm/app/simulation.py", line 263, in _simulate
+    self._generate_reports(unwrapped, False)
+  File "/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/openmm/app/simulation.py", line 282, in _generate_reports
+    reporter.report(self, state)
+  File "/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/openmm/app/dcdreporter.py", line 118, in report
+    self._dcd.writeModel(positions, periodicBoxVectors=state.getPeriodicBoxVectors())
+  File "/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/openmm/app/dcdfile.py", line 180, in writeModel
+    file.flush()
+OSError: [Errno 28] No space left on device
+Exception ignored in: <function DCDReporter.__del__ at 0x7fed19261d00>
+Traceback (most recent call last):
+  File "/home/ethanz/boltz-likelihoods/.venv/lib/python3.12/site-packages/openmm/app/dcdreporter.py", line 121, in __del__
+OSError: [Errno 28] No space left on device

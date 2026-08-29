@@ -11,14 +11,14 @@ SCRIPT_PATH=run_boltz.sh
 # --------------------------------------------------------------------------- #
 # Change the four arguments below as needed.
 YAML=examples/chignolin.yaml
-MODE=likelihood
-EXP_NAME=new_hutchinson_test
-HEAD_INIT=conditioning/chignolin # Comment this line out if not providing head_init.
+MODE=umbrella
+EXP_NAME=chignolin_umbrella_test
+# HEAD_INIT=conditioning/trpcage # Comment this line out if not providing head_init.
 
 
 MAIN_ARGS=(
     --model boltz1 \
-    --max_parallel_samples 5 \
+    --max_parallel_samples 20 \
     --out_dir ./predictions/ \
     --use_msa_server \
     --confidence False \
@@ -27,6 +27,7 @@ MAIN_ARGS=(
     --mode "$MODE" \
     --experiment_name "$EXP_NAME" \
     --slurm_path "$SCRIPT_PATH"
+    --accelerator cpu
 )
 
 if [[ -n "$HEAD_INIT" ]]; then
@@ -51,6 +52,12 @@ PRED_ARGS=(
     --diffusion_samples 1 \
 )
 
+# Score args, used by both Langevin and umbrella sampling to set the
+# score's time value.
+SCORE_ARGS=(
+    --diffusion_stop 180
+)
+
 
 # The following arguments pertain to specific inference modes.
 # A mode's arguments do not affect runs of other modes. 
@@ -59,16 +66,23 @@ PRED_ARGS=(
 # Args for likelihood calculation.
 LIKELIHOOD_ARGS=(
     --likelihood_mode hutchinson \
-    --hutchinson_samples 20
+    --hutchinson_samples 20 \
+    --ode_batch_size 10 \
 )
 
 # Args for Langevin sampling.
 LANGEVIN_ARGS=(
-    --langevin_sampling_steps 5000 \
-    --langevin_eps 0.001 \
+    --langevin_sampling_steps 250000 \
+    --langevin_eps 0.00001 \
     --langevin_noise_scale 1.0 \
-    --diffusion_stop 195 \
-    --replicates 1
+    --replicates 5
+)
+
+# Args for umbrella sampling.
+UMBRELLA_ARGS=(
+    --umbrella_functor Chignolin \
+    --umbrella_json \
+    --umbrella_steps 100
 )
 
 # Main run function.
@@ -78,6 +92,7 @@ boltz predict \
     "${ODE_ARGS[@]}" \
     "${MAIN_ARGS[@]}" \
     "${PRED_ARGS[@]}" \
-    "${LIKELIHOOD_ARGS[@]}"
-   
+    "${LIKELIHOOD_ARGS[@]}" \
+    "${SCORE_ARGS[@]}" \
+    "${UMBRELLA_ARGS[@]}"
 

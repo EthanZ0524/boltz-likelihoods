@@ -346,7 +346,7 @@ def filter_inputs_structure(
 ) -> Manifest:
     """Filter the manifest to only include missing predictions.
 
-    Parameters
+    P  arameters
     ----------
     manifest : Manifest
         The manifest of the input data.
@@ -817,40 +817,10 @@ def cli() -> None:
     default=195,
 )
 @click.option(
-    "--langevin_sampling_steps",
-    type=int,
-    help="The number of Langevin sampling steps to do.",
-    default=5000,
-)
-@click.option(
     "--mode",
-    type=click.Choice(["predict_diff", "predict_pfode", "langevin", "likelihood", "umbrella"]),
-    help="The type of inference to do.",
+    type=click.Choice(["predict_diff", "predict_pfode", "umbrella"]),
+    help="The mode Boltz will be run in.",
     default="predict_diff",
-)
-@click.option(
-    "--langevin_eps",
-    type=float,
-    help="Step size for Langevin sampling.",
-    default=1e-3
-)
-@click.option(
-    "--langevin_noise_scale",
-    type=float,
-    help="Brownian noise scale for Langevin sampling.",
-    default=1.0
-)
-@click.option(
-    "--stride",
-    type=int,
-    help="Saving every n-th frame of Langevin simulations.",
-    default=100
-)
-@click.option(
-    "--replicates",
-    type=int,
-    help="Number of replicates ran for each Langevin initial struct.",
-    default=1
 )
 @click.option(
     "--head_init", 
@@ -919,87 +889,6 @@ def cli() -> None:
         "Relative tol value for ODEs (likelihood and sampling). "
         "Default is 1e-3 (Scipy RK45 default)."
     )
-)
-@click.option(
-    "--likelihood_mode",
-    type=click.Choice(["jac", "hutchinson"]),
-    default='jac',
-    help=(
-        "Method to use for score divergence estimation in likelihood "
-        "calculations. "
-        "Default is torch Jacobian computation."
-    )
-)
-@click.option(
-    "--hutchinson_samples",
-    type=int,
-    default=1,
-    help=(
-        "The number of samples to compute for Hutchinson trace "
-        "approximation. Default is 1."
-    )
-)
-@click.option(
-    "--ode_batch_size",
-    type=int,
-    default=1,
-    help=(
-        "The number of samples to compute in parallel for the ODE likelihood calculation."
-        "Default is 1."
-    )
-)
-@click.option(
-    "--ips_likelihood",
-    is_flag=True,
-    help="Whether to use the Importance Sampling (IS) likelihood estimation."
-)
-@click.option(
-    "--num_mc_samples",
-    type=int,
-    default=1000,    
-    help="How many Monte Carlo samples to use for the IS likelihood estimation. Default is 1000."
-)
-@click.option(
-    "--umbrella_steps",
-    type=int,
-    default=100000,
-    help=(
-        "The number of simulation steps for each umbrella sampling window."
-        "Default is 1."
-    )
-)
-@click.option(
-    "--umbrella_json",
-    type=click.Path(exists=True),
-    help="The path to the umbrella.json file containing umbrella sampling centers and parameters.",
-    default=None
-)
-@click.option(
-    "--umbrella_functor",
-    type=str,
-    help=(
-        "The name of the functor class defined in "
-        "src/boltz/lutils/cvs.py used to compute CVs for the given "
-        "umbrella sampling system."
-    ),
-    default=None
-)
-@click.option(
-    "--umbrella_top",
-    type=click.Path(exists=True),
-    help=(
-        "A path to the PDB file to use as the topology for the "
-        "'Boltz-ified' umbrella sampling systems."
-    ),
-    default=None
-)
-@click.option(
-    "--umbrella_temp",
-    type=float,
-    help=(
-        "Model's implicit 'temperature' for umbrella simulations."
-    ),
-    default=50.
 )
 @click.option(
     "--umbrellav2_temperature",
@@ -1082,11 +971,8 @@ def cli() -> None:
 )
 @click.option(
     "--integrator",
-    type=str,
-    help=(
-        "Integrator to use for simulations. "
-        "Options are 'OVRVO' and 'Brownian'"
-    ),
+    type=click.Choice(["Brownian", "OVRVO"]),
+    help="Integrator to use for simulations.",
     default="OVRVO",
 )
 @click.option(
@@ -1266,11 +1152,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     recycling_steps: int = 3,
     diffusion_sampling_steps: int = 200,
     diffusion_stop: int = 195,
-    langevin_sampling_steps: int = 5000,
-    langevin_eps: float = 1e-3,
-    langevin_noise_scale: float = 1.0,
-    stride: int = 100,
-    replicates: int = 1,
     head_init: str = None,
     save_conditioning_args: bool = False,
     diffusion_samples: int = 1,
@@ -1280,16 +1161,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     step_scale: Optional[float] = None,
     atol: float = 1e-6,
     rtol: float = 1e-3,
-    likelihood_mode: str = 'jac',
-    hutchinson_samples: int = 1,
-    ode_batch_size: int = 1,
-    ips_likelihood: bool = False,
-    num_mc_samples: int = 1000,
-    umbrella_steps: int = 100000,
-    umbrella_json: str = None,
-    umbrella_functor: str = None,
-    umbrella_top: str = None,
-    umbrella_temp: int = 50,
     umbrellav2_temperature: float = 300.0,
     umbrellav2_starting_positions: str = None,
     umbrellav2_use_overdamped: bool = False,
@@ -1563,8 +1434,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 torch.save(ckpt, cache / "boltz1_noconfidence.ckpt")
             checkpoint = cache / "boltz1_noconfidence.ckpt"
 
-        # Fairscale checkpointing off for likelihood and umbrella calcs.
-        if mode == 'likelihood' or mode == 'umbrella':
+        # Fairscale checkpointing off for umbrella calcs.
+        if mode == 'umbrella':
             ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
             score_model_args = ckpt['hyper_parameters']['score_model_args']
             score_model_args['activation_checkpointing'] = False # Allow gradient tracking.
@@ -1599,76 +1470,30 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             )
         model_module.eval()
         model_module.to(device="cuda" if accelerator == "gpu" else "cpu")
-        
-        # Checking argument incompatibilities.
-        if mode == 'langevin':
-            if diffusion_sampling_steps < diffusion_stop:
-                raise ValueError(
-                    f"diffusion_sampling_steps must be larger than"
-                    f" diffusion_stop, but diffusion_sampling_steps is "
-                    f"{diffusion_sampling_steps} and diffusion_stop is "
-                    f" {diffusion_stop}."
-                ) 
-
-        langevin_args = {
-            "diffusion_stop": diffusion_stop,
-            "langevin_sampling_steps": langevin_sampling_steps,
-            "langevin_eps": langevin_eps,
-            "langevin_noise_scale": langevin_noise_scale,
-            "stride": stride,
-            "outdir": out_dir / "trajectories",
-            "replicates": replicates
-        }
-            
-        model_module.langevin_args = langevin_args
+     
+        # Preparation + logic for Boltz inference modes.
+        # ------------------------------------------------------------------- #
+        model_module.mode = mode
+        model_module.outdir = out_dir
+        model_module.save_conditioning_args = save_conditioning_args
+        head_init = Path(head_init).expanduser().resolve() if head_init else None         
+        if head_init is not None:
+            model_module.head_init = str(head_init)
 
         ode_args = {
             'rtol': rtol,
             'atol': atol
         }
         model_module.ode_args = ode_args
-
-        if mode == 'likelihood':
-            if head_init is None:
-                raise ValueError(
-                    "--head_init directory is required for likelihood "
-                    "calculation."
-                )
             
-        # if mode == 'umbrella':
-        #     if umbrella_json is None:
-        #         raise ValueError(
-        #             "--umbrella_json is required for umbrella sampling."
-        #         )
-        #     if umbrella_functor is None:
-        #         raise ValueError(
-        #             "--umbrella_functor is required for umbrella sampling."
-        #         )
-            
-        head_init = Path(head_init).expanduser().resolve() if head_init else None         
-        likelihood_args = ode_args.copy()
-        likelihood_args['outdir'] = out_dir
-        likelihood_args['likelihood_mode'] = likelihood_mode
-        likelihood_args['hutchinson_samples'] = hutchinson_samples
-        likelihood_args['ode_batch_size'] = ode_batch_size
-        likelihood_args['ips_likelihood'] = ips_likelihood
-        likelihood_args['num_mc_samples'] = num_mc_samples
-        model_module.likelihood_args = likelihood_args
-
-        model_module.outdir = out_dir
-        if head_init is not None:
-            model_module.head_init = str(head_init)
-        model_module.save_conditioning_args = save_conditioning_args
-        model_module.mode = mode
-
-        if mode != 'likelihood' and mode != 'umbrella':
+        if mode != 'umbrella':
             trainer.predict(
                 model_module,
                 datamodule=data_module,
                 return_predictions=False,
             )
 
-        else: # Need gradients for PFODE integration/umbrella force calculation.
+        else: # We may need to use gradients in umbrella mode. 
             predict_loader = data_module.predict_dataloader()
             device = "cuda" if accelerator == "gpu" else "cpu"
 
@@ -1683,46 +1508,33 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                         feats_fixed[k] = v
                 feats = feats_fixed
 
-                set_grad_enabled = ((mode == 'likelihood' or mode == 'umbrella') and not ips_likelihood)
+                # Gradients are only needed if we are using a bias force--they are not needed for unbiased simulations.
+                set_grad_enabled = (umbrellav2_bias_potential is not None)
                 print("Grad enabled:", set_grad_enabled)
                 with torch.set_grad_enabled(set_grad_enabled):
-                    if mode == 'likelihood':
-                        model_module.likelihood(feats, recycling_steps)
-                    else:
-                        # model_module.umbrella(
-                        #     feats, 
-                        #     diffusion_stop,
-                        #     recycling_steps, 
-                        #     umbrella_steps,
-                        #     umbrella_json,
-                        #     umbrella_functor,
-                        #     umbrella_top,
-                        #     umbrella_temp, 
-                        #     out_dir / "umbrella",
-                        # )
-                        model_module.umbrellav2(
-                            feats=feats,
-                            diffusion_stop=diffusion_stop,
-                            recycling_steps=recycling_steps,
-                            starting_positions_pdb_path=umbrellav2_starting_positions,
-                            temperature=umbrellav2_temperature,
-                            use_overdamped=umbrellav2_use_overdamped,
-                            bias_potential_path=umbrellav2_bias_potential,
-                            sim_config_path=umbrellav2_sim_config,
-                            integrator_dt=integrator_dt,
-                            integrator_friction=integrator_friction,
-                            integrator_temperature=integrator_temperature,
-                            integrator_length_units=integrator_length_units,
-                            integrator_energy_units=integrator_energy_units,
-                            integrator_time_units=integrator_time_units,
-                            integrator_temperature_units=integrator_temperature_units,
-                            integrator=integrator,
-                            sim_num_data_points=sim_num_data_points,
-                            sim_batch_size=sim_batch_size,
-                            sim_save_freq=sim_save_freq,
-                            sim_chk_freq=sim_chk_freq,
-                            out_dir=out_dir,
-                        )
+                    model_module.umbrellav2(
+                        feats=feats,
+                        diffusion_stop=diffusion_stop,
+                        recycling_steps=recycling_steps,
+                        starting_positions_pdb_path=umbrellav2_starting_positions,
+                        temperature=umbrellav2_temperature,
+                        use_overdamped=umbrellav2_use_overdamped,
+                        bias_potential_path=umbrellav2_bias_potential,
+                        sim_config_path=umbrellav2_sim_config,
+                        integrator_dt=integrator_dt,
+                        integrator_friction=integrator_friction,
+                        integrator_temperature=integrator_temperature,
+                        integrator_length_units=integrator_length_units,
+                        integrator_energy_units=integrator_energy_units,
+                        integrator_time_units=integrator_time_units,
+                        integrator_temperature_units=integrator_temperature_units,
+                        integrator=integrator,
+                        sim_num_data_points=sim_num_data_points,
+                        sim_batch_size=sim_batch_size,
+                        sim_save_freq=sim_save_freq,
+                        sim_chk_freq=sim_chk_freq,
+                        out_dir=out_dir,
+                    )
 
     # Check if affinity predictions are needed
     if any(r.affinity for r in manifest.records):

@@ -12,7 +12,7 @@ def _get_resnum(atom_name: str) -> int:
     return int(match.group(1))
 
 def pdb_to_boltz_coords(
-    pdb_file: str,
+    init_pdb: md.Trajectory,
     yaml_seq: str,
     atom_mask: torch.tensor,
     device: str,
@@ -27,9 +27,9 @@ def pdb_to_boltz_coords(
 
     Parameters
     ----------
-    pdb_file : str
-        Path to PDB file to convert to Boltz coordinates.
-    
+    init_pdb : md.Trajectory
+        MDTraj trajectory object containing the PDB data to convert to Boltz coordinates.
+
     yaml_seq : str
         Sequence provided to Boltz through the YAML input file. Needs
         to match with the protein sequence. Eg. YYDPETGTWY
@@ -80,14 +80,13 @@ def pdb_to_boltz_coords(
 
     Secondly, the PDB should match the inputted YAML sequence.
     '''
-    init_pdb = md.load(pdb_file)
     prot = init_pdb.topology.select("protein")
     pdb = init_pdb.atom_slice(prot)
     
     # Validate frame_index
     if frame_index >= pdb.n_frames:
         print(
-            f"Frame index {frame_index} is out of range for PDB {pdb_file} "
+            f"Frame index {frame_index} is out of range for selected PDB, "
             f"which has {pdb.n_frames} frames. Using frame 0 instead."
         )
         frame_index = 0
@@ -105,7 +104,7 @@ def pdb_to_boltz_coords(
     if len(noncanonical_indices) > 0:
         print(
             f"Noncanonical residues found at the following "
-            f"indices: {noncanonical_indices} for PDB {pdb_file}."
+            f"indices: {noncanonical_indices} for selected PDB."
         )
         return None
     
@@ -118,7 +117,7 @@ def pdb_to_boltz_coords(
         has_ace = True
 
     if "".join(pdb_seq) != yaml_seq:
-        print(f"Mismatched sequences for PDB {pdb_file}")
+        print(f"Mismatched sequences for selected PDB.")
         return None
     
     '''If no errors occurred, we can process PDB coordinates safely.
@@ -157,7 +156,7 @@ def pdb_to_boltz_coords(
                 masses.append(atom_coords[atom_fullname][2])
             except Exception as e:
                 raise Exception(
-                    f"A Boltz canonical atom {atom} is missing in PDB {pdb_file}, "
+                    f"A Boltz canonical atom {atom} is missing in the selected PDB, "
                     f"residue {res}{i}."
                 ) from e
 
@@ -167,7 +166,7 @@ def pdb_to_boltz_coords(
     rows_to_pad = padding_dim - coord_tensor.shape[0]
     if rows_to_pad < 0: # TODO: in principle, this shouldn't be necessary anymore
         print(
-            f'Provided PDB {pdb_file} has more atoms than the '
+            f'Provided PDB has more atoms than the '
             f'input conditioning tensors. Skipping.'
         )
         return None

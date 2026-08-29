@@ -7,6 +7,7 @@ import numpy as np
 from pathlib import Path
 import glob
 import json
+import time
 from typing import Any, Optional
 
 import torch
@@ -273,9 +274,7 @@ class Boltz1(LightningModule):
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
-        self.langevin_args = None
         self.ode_args = None
-        self.likelihood_args = None
 
         self.outdir = None
         self.head_init = None
@@ -464,150 +463,6 @@ class Boltz1(LightningModule):
         ):
             self.use_kernels = False
 
-    def likelihood(
-        self,
-        feats,
-        recycling_steps,
-    ):
-        """Outer wrapper of likelihood calculations.
-
-        Checks head_init inputs - if no Pairformer outputs are provided, 
-        runs the Pairformer + throws an error if no input coords are 
-        provided - and then runs likelihood calculations.
-        """
-        chains = feats["record"][0].chains
-        sequences = [chain.sequence for chain in chains]
-        tensor_dict, _, input_coords = self._load_head_init(sequences, feats["atom_pad_mask"])
-
-        if input_coords is None:
-            raise ValueError(
-                'No input PDB file(s) provided.'
-            )
-        
-        if tensor_dict is None:
-            tensor_dict, _ = self._run_pairformer(
-                feats,
-                recycling_steps
-            )
-        
-        s = tensor_dict['s']
-        z = tensor_dict['z']
-        s_inputs = tensor_dict['s_inputs']
-        relative_position_encoding = tensor_dict['relative_position_encoding']
-        if self.likelihood_args["ips_likelihood"]:
-            self.structure_module.calc_likelihoods_ips(
-                s_trunk=s,
-                z_trunk=z,
-                s_inputs=s_inputs, # Pre-trunk token-level sequence.
-                feats=feats,
-                relative_position_encoding=relative_position_encoding,
-                input_coords=input_coords,
-                likelihood_args=self.likelihood_args
-            )        
-        elif self.likelihood_args['ode_batch_size'] == 1:
-            self.structure_module.calc_likelihoods(
-                s_trunk=s,
-                z_trunk=z,
-                s_inputs=s_inputs, # Pre-trunk token-level sequence.
-                feats=feats,
-                relative_position_encoding=relative_position_encoding,
-                input_coords=input_coords,
-                likelihood_args=self.likelihood_args
-            )
-        else:
-            self.structure_module.calc_likelihoods_parallel_to(
-                s_trunk=s,
-                z_trunk=z,
-                s_inputs=s_inputs, # Pre-trunk token-level sequence.
-                feats=feats,
-                relative_position_encoding=relative_position_encoding,
-                input_coords=input_coords,
-                likelihood_args=self.likelihood_args,
-            )
-
-    def umbrella(
-        self,
-        feats,
-        diffusion_stop,
-        recycling_steps,
-        umbrella_steps,
-        umbrella_json,
-        umbrella_functor,
-        umbrella_top,
-        umbrella_temp,
-        outdir
-    ):
-        """Outer wrapper of umbrella sampling calculations.
-
-        Checks head_init inputs - if no Pairformer outputs are provided, 
-        runs the Pairformer. Checks if the required umbrella.json is 
-        provided and processes it if it does (throws an error if not). 
-
-        Parameters
-        ----------
-        umbrella_steps : int
-            Number of simulation steps to run per umbrella window.
-
-        umbrella_json : str
-            Path to 
-
-        umbrella_temp : float
-        """
-        # Retrieving score module conditioning tensors.
-        atom_mask = feats["atom_pad_mask"]
-    
-        chains = feats["record"][0].chains
-        sequences = [chain.sequence for chain in chains]
-        tensor_dict = None
-        if self.head_init:
-            tensor_dict, _, _ = self._load_head_init(sequences, feats["atom_pad_mask"])
-
-        
-        if tensor_dict is None: # Run Pairformer if not pre-computed.
-            tensor_dict, _ = self._run_pairformer(
-                feats,
-                recycling_steps
-            )
-
-        s = tensor_dict['s']
-        z = tensor_dict['z']
-        s_inputs = tensor_dict['s_inputs']
-        relative_position_encoding = tensor_dict['relative_position_encoding']
-        
-        # Retrieving umbrella simulation input coordinates.
-        with open(umbrella_json, 'r') as file:
-            param_dict = json.load(file)
-
-        coord_list = []        
-
-        for (pdb_file, _) in param_dict.items():
-            coords, elements, masses = pdb_to_boltz_coords(
-                pdb_file=pdb_file,
-                yaml_seq=sequences[0],
-                atom_mask=atom_mask,
-                device=self.device
-            )
-            coord_list.append(coords)
-        coord_sets = torch.stack(coord_list, axis=0)
-        self.structure_module.run_umbrella(
-            coord_sets=coord_sets,
-            umbrella_steps=umbrella_steps,
-            param_dict=param_dict,
-            umbrella_functor=umbrella_functor,
-            umbrella_top=umbrella_top,
-            umbrella_temp=umbrella_temp,
-            diffusion_stop=diffusion_stop,
-            atom_mask=atom_mask,
-            masses=masses,
-            elements=elements,
-            outdir=outdir,
-            s_trunk=s,
-            z_trunk=z,
-            s_inputs=s_inputs, # Pre-trunk token-level sequence.
-            feats=feats,
-            relative_position_encoding=relative_position_encoding,
-        )
-
     def umbrellav2(
         self,
         feats,
@@ -695,10 +550,11 @@ class Boltz1(LightningModule):
         coord_list = []        
 
         n_starting_pos = md.load(starting_positions_pdb_path).n_frames
+        init_pdb = md.load(starting_positions_pdb_path)
         for frame_index in range(n_starting_pos):
             # coords are output in angstroms
             coords, elements, masses = pdb_to_boltz_coords(
-                pdb_file=starting_positions_pdb_path,
+                init_pdb=init_pdb,
                 yaml_seq=sequences[0],
                 atom_mask=atom_mask,
                 device=self.device,
@@ -707,7 +563,6 @@ class Boltz1(LightningModule):
             )
             coord_list.append(coords)
         coord_sets = torch.stack(coord_list, axis=0)
-        torch.save(masses, 'masses.pt')
 
         sigmas = self.structure_module.sample_schedule(200)
         gammas = torch.where(sigmas > self.structure_module.gamma_min, self.structure_module.gamma_0, 0.0) # gamma_min=1, gamma_0=0.8.
@@ -748,7 +603,6 @@ class Boltz1(LightningModule):
             "relative_position_encoding":relative_position_encoding_expanded,
         }
         
-
         self.structure_module.set_force_parameters(
             batch_size=batch_size, 
             atom_mask=atom_mask,
@@ -823,18 +677,13 @@ class Boltz1(LightningModule):
         max_parallel_samples: Optional[int] = None,
         run_confidence_sequentially: bool = False,
     ) -> dict[str, Tensor]:
-        """Handles inference logic.
+        """Structure prediction using either diffusion or PFODE integration.
 
-        Three inference modes are available - structure prediction with
-        diffusion sampling, structure prediction using PFODE, and  
-        Langevin sampling.
-         
         The entire inference pipeline (input preparation, 
         Pairformer, and mode-specific head) can be run. Alternatively, 
-        the first two steps can be skipped for all three modes can be 
-        skipped if pre-computed Pairformer outputs are provided to 
-        initialize the inference head with via the --head_init 
-        (self.head_init) directory.
+        the first two steps can be skipped both modes if pre-computed 
+        Pairformer outputs are provided to initialize the structure 
+        head with via the --head_init (self.head_init) directory.
 
         Parameters
         ----------
@@ -851,16 +700,15 @@ class Boltz1(LightningModule):
             For memory/efficiency purposes.
         """
         tensor_dict = None
-        input_coords = None # Coordinates for Langevin/likelihoods. 
         atom_mask = feats["atom_pad_mask"]
         
         if self.head_init:
             chains = feats["record"][0].chains
             sequences = [chain.sequence for chain in chains]
-            tensor_dict, pdistogram, input_coords = self._load_head_init(sequences, feats["atom_pad_mask"])
+            tensor_dict, pdistogram, _ = self._load_head_init(sequences, feats["atom_pad_mask"])
 
         # Run the Pairformer only if not given pre-computed Pairformer outputs.
-        if tensor_dict is None: # pdistogram will also either be None or won't be instantiated.
+        if tensor_dict is None: 
             '''Either no head_init folder was given, or Pairformer 
             tensors are not provided in head_init. Either way, we must 
             compute them.
@@ -898,25 +746,6 @@ class Boltz1(LightningModule):
                     feats=feats,
                     relative_position_encoding=relative_position_encoding,
                     multiplicity=multiplicity_diffusion_train,
-                )
-            )
-
-        # Langevin.
-        # ------------------------------------------------------------------- #
-        if self.mode == 'langevin':
-            dict_out.update(
-                self.structure_module.langevin(
-                    s_trunk=s,
-                    z_trunk=z,
-                    s_inputs=s_inputs, # Pre-trunk token-level sequence.
-                    feats=feats,
-                    relative_position_encoding=relative_position_encoding,
-                    diffusion_sampling_steps=num_sampling_steps,
-                    atom_mask=atom_mask,
-                    multiplicity=diffusion_samples, # Num. samples to generate
-                    max_parallel_samples=max_parallel_samples,
-                    input_coords=input_coords, 
-                    langevin_args=self.langevin_args
                 )
             )
 

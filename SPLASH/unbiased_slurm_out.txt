@@ -1,0 +1,2 @@
+Finished with energy minimization.
+Done equilibrating, saved checkpoint.
